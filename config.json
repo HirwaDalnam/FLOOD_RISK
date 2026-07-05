@@ -1,0 +1,21 @@
+{
+  "lookback": 96,
+  "feature_cols": [
+    "Stage_m",
+    "Discharge_m3s",
+    "Precipitation_mm",
+    "Rain_cumsum_6h",
+    "Rain_cumsum_24h"
+  ],
+  "target_cols": [
+    "Stage_m",
+    "Discharge_log"
+  ],
+  "lat": -1.9692,
+  "lon": 30.0883,
+  "timezone": "Africa/Kigali",
+  "test_rmse_stage": 0.06276700838752614,
+  "test_rmse_discharge": 0.8499912549907808,
+  "test_nse_stage": 0.3431859393939234,
+  "test_nse_discharge": 0.20578589374801137
+}
