@@ -90,13 +90,19 @@ def load_seed_data() -> pd.DataFrame:
     Source of 'recent history' for seeding forecasts.
 
     Currently: a static CSV exported once from the training notebook.
+    Reads the FIRST column positionally as the datetime index, rather than by
+    name — this avoids failures if master_df.index.name wasn't explicitly set
+    before to_csv() in the notebook (a common source of "Missing column
+    provided to 'parse_dates'" errors).
+
     To switch to live telemetry later: replace this function's body with a
     call to your sensor API/database, keeping the same return shape
     (a DataFrame indexed by naive datetime, with columns == FEATURE_COLS,
     where Discharge_m3s stays in REAL units — the log-transform only ever
     applies to the training target, never to feature inputs).
     """
-    df = pd.read_csv('seed_data.csv', parse_dates=['Timestamp'], index_col='Timestamp')
+    df = pd.read_csv('seed_data.csv', index_col=0, parse_dates=True)
+    df.index.name = 'Timestamp'
     return df
 
 
