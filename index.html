@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SW27 Flood Forecast</title>
+<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+<style>
+  body {
+    font-family: system-ui, -apple-system, sans-serif;
+    background: #f4f6f8;
+    margin: 0;
+    padding: 24px 16px;
+  }
+  #flood-widget {
+    max-width: 800px;
+    margin: 0 auto;
+  }
+  .header-banner {
+    background: linear-gradient(135deg, #0d3b5c 0%, #1f77b4 60%, #3fa9d6 100%);
+    border-radius: 12px;
+    padding: 20px 24px;
+    color: #fff;
+    margin-bottom: 16px;
+  }
+  .header-banner h1 {
+    margin: 0 0 4px 0;
+    font-size: 1.4em;
+  }
+  .header-banner p {
+    margin: 0;
+    opacity: 0.85;
+    font-size: 0.85em;
+  }
+  .controls {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    margin-bottom: 16px;
+    background: #fff;
+    padding: 16px;
+    border-radius: 10px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  }
+  .controls label {
+    display: block;
+    font-size: 0.8em;
+    color: #555;
+    margin-bottom: 4px;
+  }
+  .controls input, .controls select {
+    padding: 6px 8px;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+  }
+  #fw-submit {
+    padding: 8px 18px;
+    background: #1f77b4;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-weight: 600;
+  }
+  #fw-submit:hover { background: #175a8a; }
+  #fw-status {
+    font-size: 0.85em;
+    color: #777;
+    margin-bottom: 8px;
+  }
+  #fw-chart {
+    width: 100%;
+    height: 750px;
+    background: #fff;
+    border-radius: 10px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+  }
+  .cold-start-note {
+    font-size: 0.8em;
+    color: #888;
+    margin-top: 12px;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<div id="flood-widget">
+
+  <div class="header-banner">
+    <h1>SW27 Flood Forecast</h1>
+    <p>Scenario-based LSTM forecast — jointly predicts stage and discharge from
+       historical station data, not live telemetry. Rainfall inputs are live via Open-Meteo.</p>
+  </div>
+
+  <div class="controls">
+    <div>
+      <label for="fw-start">Start time</label>
+      <input type="datetime-local" id="fw-start">
+    </div>
+    <div>
+      <label for="fw-horizon-value">Horizon</label>
+      <input type="number" id="fw-horizon-value" value="5" min="1" style="width:60px;">
+    </div>
+    <div>
+      <label for="fw-horizon-unit">Unit</label>
+      <select id="fw-horizon-unit">
+        <option value="hours">Hours</option>
+        <option value="days">Days</option>
+        <option value="weeks">Weeks</option>
+      </select>
+    </div>
+    <button id="fw-submit">Run Forecast</button>
+  </div>
+
+  <div id="fw-status"></div>
+  <div id="fw-chart"></div>
+
+  <p class="cold-start-note">
+    Note: the forecast API may take up to a minute to respond on the first request
+    after a period of inactivity (free-tier hosting spins down when idle).
+  </p>
+
+</div>
+
+<script>
+(function () {
+  var API_BASE_URL = "https://flood-risk-sxm3.onrender.com";
+
+  var startInput = document.getElementById('fw-start');
+  var now = new Date();
+  now.setMinutes(Math.floor(now.getMinutes() / 15) * 15);
+  startInput.value = now.toISOString().slice(0, 16);
+
+  document.getElementById('fw-submit').addEventListener('click', function () {
+    var start = document.getElementById('fw-start').value;
+    var horizonValue = document.getElementById('fw-horizon-value').value;
+    var horizonUnit = document.getElementById('fw-horizon-unit').value;
+    var statusEl = document.getElementById('fw-status');
+
+    statusEl.textContent = "Running forecast... (may take up to a minute if the API was idle)";
+
+    var url = API_BASE_URL + "/forecast?start=" + encodeURIComponent(start) +
+              "&horizon_value=" + horizonValue + "&horizon_unit=" + horizonUnit;
+
+    fetch(url)
+      .then(function (res) {
+        if (!res.ok) return res.json().then(function(e){ throw new Error(e.detail || ("API error " + res.status)); });
+        return res.json();
+      })
+      .then(function (data) {
+        var gapNote = data.seed_data_gap_minutes > 15
+          ? " (seed data is " + Math.round(data.seed_data_gap_minutes / 60) + "h before requested start)"
+          : "";
+        statusEl.textContent = (data.is_live_feed ? "Live sensor feed" : "Historical scenario data") + gapNote;
+
+        var histTimes = data.recent_history.map(function (d) { return d.time; });
+        var histStage = data.recent_history.map(function (d) { return d.stage_m; });
+        var histDischarge = data.recent_history.map(function (d) { return d.discharge_m3s; });
+
+        var fcTimes = data.forecast.map(function (d) { return d.time; });
+        var fcStage = data.forecast.map(function (d) { return d.predicted_stage_m; });
+        var fcStageUpper = data.forecast.map(function (d) { return d.stage_upper_m; });
+        var fcStageLower = data.forecast.map(function (d) { return d.stage_lower_m; });
+        var fcDischarge = data.forecast.map(function (d) { return d.predicted_discharge_m3s; });
+        var fcDischargeUpper = data.forecast.map(function (d) { return d.discharge_upper_m3s; });
+        var fcDischargeLower = data.forecast.map(function (d) { return d.discharge_lower_m3s; });
+        var fcRain = data.forecast.map(function (d) { return d.forecasted_rain_mm_hr; });
+
+        var traces = [
+          { x: histTimes, y: histStage, name: 'Observed Stage', mode: 'lines',
+            line: { color: '#1f77b4', width: 2 }, xaxis: 'x', yaxis: 'y' },
+          { x: fcTimes, y: fcStage, name: 'Stage Forecast', mode: 'lines',
+            line: { color: '#d62728', width: 2, dash: 'dash' }, xaxis: 'x', yaxis: 'y' },
+          { x: fcTimes.concat(fcTimes.slice().reverse()),
+            y: fcStageUpper.concat(fcStageLower.slice().reverse()),
+            fill: 'toself', fillcolor: 'rgba(214,39,40,0.15)',
+            line: { color: 'transparent' }, name: 'Stage uncertainty',
+            xaxis: 'x', yaxis: 'y' },
+
+          { x: histTimes, y: histDischarge, name: 'Observed Discharge', mode: 'lines',
+            line: { color: '#ff7f0e', width: 2 }, xaxis: 'x2', yaxis: 'y2' },
+          { x: fcTimes, y: fcDischarge, name: 'Discharge Forecast', mode: 'lines',
+            line: { color: '#9467bd', width: 2, dash: 'dash' }, xaxis: 'x2', yaxis: 'y2' },
+          { x: fcTimes.concat(fcTimes.slice().reverse()),
+            y: fcDischargeUpper.concat(fcDischargeLower.slice().reverse()),
+            fill: 'toself', fillcolor: 'rgba(148,103,189,0.15)',
+            line: { color: 'transparent' }, name: 'Discharge uncertainty',
+            xaxis: 'x2', yaxis: 'y2' },
+
+          { x: fcTimes, y: fcRain, name: 'Forecasted Rain (mm/hr)', type: 'bar',
+            marker: { color: '#2ca02c' }, xaxis: 'x3', yaxis: 'y3' }
+        ];
+
+        var layout = {
+          grid: { rows: 3, columns: 1, pattern: 'independent', roworder: 'top to bottom' },
+          margin: { t: 30, r: 20, l: 55, b: 40 },
+          hovermode: 'x unified',
+          showlegend: true,
+          legend: { orientation: 'h', y: -0.08 },
+          xaxis:  { title: '', matches: 'x3' },
+          xaxis2: { title: '', matches: 'x3' },
+          xaxis3: { title: 'Time' },
+          yaxis:  { title: 'Stage (m)', domain: [0.68, 1] },
+          yaxis2: { title: 'Discharge (m³/s)', domain: [0.34, 0.62] },
+          yaxis3: { title: 'Rain (mm/hr)', domain: [0, 0.28] }
+        };
+
+        Plotly.newPlot('fw-chart', traces, layout, { responsive: true });
+      })
+      .catch(function (err) {
+        statusEl.textContent = "Error: " + err.message;
+      });
+  });
+})();
+</script>
+
+</body>
+</html>
