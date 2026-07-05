@@ -5,9 +5,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# App code + exported model artifacts (model, scalers, config, seed data)
+# App code + exported model artifacts (weights, scalers, config, seed data)
 COPY app.py .
-COPY lstm_model.keras .
+COPY model.weights.h5 .
 COPY feature_scaler.pkl .
 COPY target_scaler.pkl .
 COPY config.json .
