@@ -3,11 +3,17 @@ SW27 Flood Forecast API.
 
 Serves on-demand LSTM forecasts for Stage_m and Discharge_m3s, predicted by a
 Functional-API model with SEPARATE output heads sharing one LSTM trunk.
-IMPORTANT: model.predict() on this model returns a LIST of two arrays
-([stage_batch, discharge_log_batch]), not one combined array — this is
-different from the earlier single-Dense(2)-output model and is the most
-common source of shape-mismatch crashes when this file gets out of sync
-with whatever architecture was actually trained.
+
+IMPORTANT: this file rebuilds the model ARCHITECTURE directly in code and
+loads only the trained WEIGHTS (model.weights.h5), rather than using
+load_model() on the full .keras file. This sidesteps a class of error where
+a model saved by a newer Keras version fails to deserialize on an older one
+(e.g. "Unrecognized keyword arguments passed to Dense: {'quantization_config':
+None}") — reconstructing the architecture directly avoids Keras needing to
+interpret any saved config at all.
+
+**If you change the model architecture in the notebook, mirror that change
+in build_model() below, or the weights won't line up with the layers.**
 
 Discharge is trained and predicted in LOG-SPACE (np.log1p at training time)
 to handle its right-skewed distribution — every discharge value coming out
@@ -28,12 +34,13 @@ import pandas as pd
 import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from tensorflow.keras.models import load_model
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
+from tensorflow.keras.models import Model
 
 warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
 
 # ------------------------------------------------------------------
-# Load model + scalers + config + seed data once, at startup
+# Load config + scalers + seed data
 # ------------------------------------------------------------------
 with open('config.json') as f:
     CONFIG = json.load(f)
@@ -46,18 +53,36 @@ TIMEZONE = CONFIG['timezone']
 
 TEST_RMSE_STAGE = CONFIG.get('test_rmse_stage', CONFIG.get('test_rmse', 0.05))
 TEST_RMSE_DISCHARGE = CONFIG.get('test_rmse_discharge', 0.0)
-
-# Whether the second target column needs np.expm1() to become real discharge units.
-# Checked by name rather than hardcoded, so this file keeps working if a future
-# export goes back to raw (non-log) discharge as the target.
 DISCHARGE_IS_LOG = 'Discharge_log' in TARGET_COLS
-
-model = load_model('lstm_model.keras')
 
 with open('feature_scaler.pkl', 'rb') as f:
     feature_scaler = pickle.load(f)
 with open('target_scaler.pkl', 'rb') as f:
     target_scaler = pickle.load(f)
+
+
+# ------------------------------------------------------------------
+# Rebuild the EXACT architecture from the notebook, then load weights only.
+# Must match cell 14 of the training notebook layer-for-layer.
+# ------------------------------------------------------------------
+def build_model(lookback: int, n_features: int) -> Model:
+    inputs = Input(shape=(lookback, n_features))
+    x = LSTM(64, return_sequences=True)(inputs)
+    x = Dropout(0.2)(x)
+    shared = LSTM(32)(x)
+    shared = Dropout(0.2)(shared)
+
+    stage_head = Dense(16, activation='relu')(shared)
+    stage_out = Dense(1, name='stage_output')(stage_head)
+
+    discharge_head = Dense(16, activation='relu')(shared)
+    discharge_out = Dense(1, name='discharge_output')(discharge_head)
+
+    return Model(inputs=inputs, outputs=[stage_out, discharge_out])
+
+
+model = build_model(LOOKBACK, len(FEATURE_COLS))
+model.load_weights('model.weights.h5')
 
 
 def load_seed_data() -> pd.DataFrame:
@@ -89,20 +114,9 @@ app.add_middleware(
 
 
 def predict_step(window_batch: np.ndarray) -> tuple[float, float]:
-    """
-    Runs one forward pass and returns (predicted_stage_m, predicted_discharge_m3s)
-    in REAL units, handling both possible model output shapes:
-      - list of two arrays (separate-heads Functional model, current architecture)
-      - single (1, 2) array (older single-Dense(2) architecture)
-    """
-    raw_pred = model.predict(window_batch, verbose=0)
-
-    if isinstance(raw_pred, (list, tuple)):
-        # Separate-heads model: [stage_array(1,1), discharge_array(1,1)]
-        predicted_scaled = np.array([raw_pred[0][0][0], raw_pred[1][0][0]])
-    else:
-        # Single combined-output model: array shape (1, 2)
-        predicted_scaled = raw_pred[0]
+    """Returns (predicted_stage_m, predicted_discharge_m3s) in REAL units."""
+    stage_arr, discharge_arr = model.predict(window_batch, verbose=0)
+    predicted_scaled = np.array([stage_arr[0][0], discharge_arr[0][0]])
 
     if np.isnan(predicted_scaled).any():
         raise ValueError("NaN in model output")
@@ -147,8 +161,6 @@ def forecast(
         total_minutes = horizon_value * 7 * 24 * 60
     total_steps = int(total_minutes / 15)
 
-    # Guard against very long recursive horizons stalling the request (see earlier
-    # performance note: each step is its own sequential model.predict() call)
     MAX_STEPS = 672  # 7 days at 15-min resolution
     if total_steps > MAX_STEPS:
         raise HTTPException(
@@ -234,8 +246,6 @@ def forecast(
         rain_6h = rain_6h + current_rain - (rain_6h / 24)
         rain_24h = rain_24h + current_rain - (rain_24h / 96)
 
-        # Feed real-unit values back into the FEATURE window (inputs are never
-        # log-transformed — only the training target was)
         new_step = pd.DataFrame(
             [[predicted_stage, predicted_discharge, current_rain, rain_6h, rain_24h]],
             columns=FEATURE_COLS
