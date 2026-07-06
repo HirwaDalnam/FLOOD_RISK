@@ -176,6 +176,103 @@ def predict_step(window_batch: np.ndarray) -> tuple[float, float]:
     return predicted_stage, predicted_discharge
 
 
+def advance_one_step(window_batch, rain_6h, rain_24h, pred_time, rain_15m):
+    """
+    Runs one recursive step: predicts stage+discharge, updates the antecedent
+    rainfall running totals, and slides the feature window forward by one row.
+    Shared by both the bridge (real-data -> now) and the visitor-facing
+    forecast loop, so they can never silently drift out of sync with each other.
+    """
+    current_rain = 0.0
+    if pred_time in rain_15m.index:
+        val = rain_15m.loc[pred_time, 'Precipitation_mm']
+        if not pd.isna(val):
+            current_rain = float(val)
+
+    predicted_stage, predicted_discharge = predict_step(window_batch)
+
+    rain_6h = rain_6h + current_rain - (rain_6h / 24)
+    rain_24h = rain_24h + current_rain - (rain_24h / 96)
+
+    new_step = pd.DataFrame(
+        [[predicted_stage, predicted_discharge, current_rain, rain_6h, rain_24h]],
+        columns=FEATURE_COLS
+    )
+    new_step_scaled = feature_scaler.transform(new_step)
+    updated_window = np.vstack([window_batch[0][1:], new_step_scaled])
+    updated_window_batch = np.expand_dims(updated_window, axis=0)
+
+    return predicted_stage, predicted_discharge, current_rain, updated_window_batch, rain_6h, rain_24h
+
+
+def build_initial_state_from_seed():
+    """Builds the starting window/rain-totals from the last LOOKBACK rows of
+    real seed data. This is the one true anchor point everything else —
+    the bridge, and any forecast that starts within real data — builds from."""
+    last_historical_data = SEED_DATA[FEATURE_COLS].iloc[-LOOKBACK:].copy()
+    if last_historical_data.isna().any().any():
+        last_historical_data = last_historical_data.ffill().bfill()
+
+    window_scaled = feature_scaler.transform(pd.DataFrame(last_historical_data, columns=FEATURE_COLS))
+    if np.isnan(window_scaled).any():
+        raise HTTPException(500, "Seed window produced NaN after scaling — check seed data.")
+
+    window_batch = np.expand_dims(window_scaled, axis=0)
+    rain_6h = last_historical_data['Rain_cumsum_6h'].iloc[-1]
+    rain_24h = last_historical_data['Rain_cumsum_24h'].iloc[-1]
+    return window_batch, rain_6h, rain_24h, last_historical_data.index.max()
+
+
+# ------------------------------------------------------------------
+# Bridge cache: fills the gap between the last real data point and "now"
+# using the model's own predictions, so visitors never see a dead gap on
+# the chart. Computed incrementally — later requests only extend forward
+# from wherever the cache already reached, instead of recomputing from
+# scratch every time (recomputing a multi-day bridge on every request would
+# be needlessly slow once dozens of visitors are hitting the same gap).
+# ------------------------------------------------------------------
+_bridge_cache = {
+    "window_batch": None,
+    "rain_6h": None,
+    "rain_24h": None,
+    "last_time": None,      # last timestamp the bridge has reached
+    "records": [],          # list of dicts: time, stage, discharge, rain — bridged (synthetic) history
+}
+MAX_BRIDGE_STEPS_PER_CALL = 2000  # safety cap (~20 days) in case of a clock/config issue
+
+
+def ensure_bridge_up_to(target_time: pd.Timestamp, rain_15m: pd.DataFrame):
+    if _bridge_cache["window_batch"] is None:
+        window_batch, rain_6h, rain_24h, last_time = build_initial_state_from_seed()
+        _bridge_cache.update({
+            "window_batch": window_batch, "rain_6h": rain_6h,
+            "rain_24h": rain_24h, "last_time": last_time, "records": [],
+        })
+
+    steps_needed = int((target_time - _bridge_cache["last_time"]).total_seconds() / 900)
+    steps_needed = min(steps_needed, MAX_BRIDGE_STEPS_PER_CALL)
+
+    for _ in range(max(steps_needed, 0)):
+        next_time = _bridge_cache["last_time"] + pd.Timedelta(minutes=15)
+        stage, discharge, rain, window_batch, rain_6h, rain_24h = advance_one_step(
+            _bridge_cache["window_batch"], _bridge_cache["rain_6h"], _bridge_cache["rain_24h"],
+            next_time, rain_15m
+        )
+        _bridge_cache["window_batch"] = window_batch
+        _bridge_cache["rain_6h"] = rain_6h
+        _bridge_cache["rain_24h"] = rain_24h
+        _bridge_cache["last_time"] = next_time
+        _bridge_cache["records"].append({
+            "time": next_time, "stage_m": stage, "discharge_m3s": discharge, "rain_mm_hr": rain * 4
+        })
+        # Keep only the tail — the cache doesn't need to hold days of bridged
+        # points once they're no longer near "now"
+        if len(_bridge_cache["records"]) > 200:
+            _bridge_cache["records"] = _bridge_cache["records"][-200:]
+
+    return _bridge_cache
+
+
 @app.get("/health")
 def health():
     return {
@@ -195,7 +292,7 @@ def forecast(
 ):
     # ---- Resolve start time ----
     if start.lower() == "latest":
-        start_time_naive = SEED_DATA.index.max()
+        start_time_naive = pd.Timestamp.now().floor('15min')
     else:
         try:
             start_time_naive = pd.Timestamp(start)
@@ -218,48 +315,54 @@ def forecast(
             f"steps (~7 days) supported per request."
         )
 
-    # ---- Build seed window ----
-    seed_source = SEED_DATA[SEED_DATA.index <= start_time_naive]
-    if len(seed_source) < LOOKBACK:
-        raise HTTPException(
-            400,
-            f"Not enough history before {start_time_naive} — need {LOOKBACK} rows, "
-            f"have {len(seed_source)}. Earliest usable start is "
-            f"{SEED_DATA.index[LOOKBACK]}."
-        )
-
-    last_historical_data = seed_source[FEATURE_COLS].iloc[-LOOKBACK:].copy()
-    data_gap_minutes = (start_time_naive - last_historical_data.index.max()).total_seconds() / 60
-
-    if last_historical_data.isna().any().any():
-        last_historical_data = last_historical_data.ffill().bfill()
-
-    current_window_scaled = feature_scaler.transform(
-        pd.DataFrame(last_historical_data, columns=FEATURE_COLS)
-    )
-    if np.isnan(current_window_scaled).any():
-        raise HTTPException(500, "Seed window produced NaN after scaling — check seed data.")
-
-    current_window_batch = np.expand_dims(current_window_scaled, axis=0)
-    rain_6h = last_historical_data['Rain_cumsum_6h'].iloc[-1]
-    rain_24h = last_historical_data['Rain_cumsum_24h'].iloc[-1]
-
-    # ---- Live rainfall forecast (cached — see get_rain_forecast()) ----
     rain_15m = get_rain_forecast()
+    real_data_end = SEED_DATA.index.max()
+    data_gap_minutes = max((start_time_naive - real_data_end).total_seconds() / 60, 0)
 
-    # ---- Recursive forecast loop ----
+    if start_time_naive <= real_data_end:
+        # Requested start falls within real data — no bridging needed, seed directly from it.
+        seed_source = SEED_DATA[SEED_DATA.index <= start_time_naive]
+        if len(seed_source) < LOOKBACK:
+            raise HTTPException(
+                400,
+                f"Not enough history before {start_time_naive} — need {LOOKBACK} rows, "
+                f"have {len(seed_source)}. Earliest usable start is {SEED_DATA.index[LOOKBACK]}."
+            )
+        last_historical_data = seed_source[FEATURE_COLS].iloc[-LOOKBACK:].copy()
+        if last_historical_data.isna().any().any():
+            last_historical_data = last_historical_data.ffill().bfill()
+        window_scaled = feature_scaler.transform(pd.DataFrame(last_historical_data, columns=FEATURE_COLS))
+        current_window_batch = np.expand_dims(window_scaled, axis=0)
+        rain_6h = last_historical_data['Rain_cumsum_6h'].iloc[-1]
+        rain_24h = last_historical_data['Rain_cumsum_24h'].iloc[-1]
+        recent_context = [
+            {"time": t.isoformat(), "stage_m": round(row.Stage_m, 4), "discharge_m3s": round(row.Discharge_m3s, 4)}
+            for t, row in seed_source[['Stage_m', 'Discharge_m3s']].iloc[-32:].iterrows()
+        ]
+    else:
+        # Requested start is beyond real data — bridge the gap with the model's
+        # own predictions so there's no dead space on the chart.
+        bridge = ensure_bridge_up_to(start_time_naive, rain_15m)
+        current_window_batch = bridge["window_batch"]
+        rain_6h = bridge["rain_6h"]
+        rain_24h = bridge["rain_24h"]
+        # Recent context is the tail of the BRIDGE (recent predicted values
+        # leading up to "now"), not days-old real readings — this is what
+        # makes the chart start near the actual call time instead of showing
+        # the whole historical record.
+        recent_context = [
+            {"time": r["time"].isoformat(), "stage_m": round(r["stage_m"], 4), "discharge_m3s": round(r["discharge_m3s"], 4)}
+            for r in bridge["records"][-32:]
+        ]
+
+    # ---- Recursive forecast loop for the visitor's actual requested horizon ----
     records = []
     for step in range(1, total_steps + 1):
         pred_time = start_time_naive + pd.Timedelta(minutes=15 * step)
-
-        current_rain = 0.0
-        if pred_time in rain_15m.index:
-            val = rain_15m.loc[pred_time, 'Precipitation_mm']
-            if not pd.isna(val):
-                current_rain = float(val)
-
         try:
-            predicted_stage, predicted_discharge = predict_step(current_window_batch)
+            stage, discharge, rain, current_window_batch, rain_6h, rain_24h = advance_one_step(
+                current_window_batch, rain_6h, rain_24h, pred_time, rain_15m
+            )
         except ValueError:
             raise HTTPException(500, f"Model produced NaN at step {step} ({pred_time}).")
 
@@ -268,37 +371,22 @@ def forecast(
 
         records.append({
             "time": pred_time.isoformat(),
-            "predicted_stage_m": round(predicted_stage, 4),
-            "stage_upper_m": round(predicted_stage + stage_unc, 4),
-            "stage_lower_m": round(predicted_stage - stage_unc, 4),
-            "predicted_discharge_m3s": round(predicted_discharge, 4),
-            "discharge_upper_m3s": round(predicted_discharge + discharge_unc, 4),
-            "discharge_lower_m3s": round(predicted_discharge - discharge_unc, 4),
-            "forecasted_rain_mm_hr": round(current_rain * 4, 3),
+            "predicted_stage_m": round(stage, 4),
+            "stage_upper_m": round(stage + stage_unc, 4),
+            "stage_lower_m": round(stage - stage_unc, 4),
+            "predicted_discharge_m3s": round(discharge, 4),
+            "discharge_upper_m3s": round(discharge + discharge_unc, 4),
+            "discharge_lower_m3s": round(discharge - discharge_unc, 4),
+            "forecasted_rain_mm_hr": round(rain * 4, 3),
         })
-
-        rain_6h = rain_6h + current_rain - (rain_6h / 24)
-        rain_24h = rain_24h + current_rain - (rain_24h / 96)
-
-        new_step = pd.DataFrame(
-            [[predicted_stage, predicted_discharge, current_rain, rain_6h, rain_24h]],
-            columns=FEATURE_COLS
-        )
-        new_step_scaled = feature_scaler.transform(new_step)
-        updated_window = np.vstack([current_window_batch[0][1:], new_step_scaled])
-        current_window_batch = np.expand_dims(updated_window, axis=0)
-
-    recent_history = SEED_DATA[SEED_DATA.index <= start_time_naive][['Stage_m', 'Discharge_m3s']].iloc[-96:]
 
     return {
         "is_live_feed": IS_LIVE_FEED,
         "seed_data_gap_minutes": round(data_gap_minutes, 1),
+        "bridged": start_time_naive > real_data_end,
         "forecast_start": start_time_naive.isoformat(),
         "horizon_value": horizon_value,
         "horizon_unit": horizon_unit,
-        "recent_history": [
-            {"time": t.isoformat(), "stage_m": round(row.Stage_m, 4), "discharge_m3s": round(row.Discharge_m3s, 4)}
-            for t, row in recent_history.iterrows()
-        ],
+        "recent_history": recent_context,
         "forecast": records,
     }
