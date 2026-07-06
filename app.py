@@ -59,6 +59,46 @@ tuple each caller owns — avoids that: each sequence's state lives in its
 own local variable / cache entry, with no shared mutable layer state to
 corrupt across threads.
 ------------------------------------------------------------------
+FIXES (2026-07-07):
+
+1. "Now" was being computed with pd.Timestamp.now().floor('15min') — the
+   server's OS-local time (whatever timezone the host happens to be in,
+   e.g. UTC on most cloud free tiers). Seed data / rain data are anchored
+   to CONFIG['timezone'] (Rwanda, Africa/Kigali). This could silently shift
+   the forecast anchor by hours. Fixed via now_local(), which computes the
+   current wall-clock time IN CONFIG['timezone'] and strips the tzinfo so
+   it compares directly against the naive seed-data / bridge timestamps.
+
+2. The gap between the static seed data (frozen at whatever date it was
+   exported, e.g. July 1st) and "now" was only bridged in small bounded
+   chunks (MAX_BRIDGE_STEPS_PER_CALL = 8, ~2h per call), relying on an
+   external cron hitting /advance-bridge on a schedule. If that cron
+   hadn't run recently (fresh deploy, cron misconfigured, cold start),
+   /forecast would silently forecast from a STALE anchor and report
+   "still_catching_up": true instead of what the visitor actually asked
+   for ("as of right now"). Fixed: /forecast now always fully catches the
+   bridge up to the current moment itself before forecasting forward — the
+   whole point of the O(1) step-model rewrite was that this is cheap
+   (~16ms/step), so there's no good reason to leave it to a maybe-running
+   cron. /advance-bridge is kept only as an optional pre-warmer so the
+   FIRST visitor of the day doesn't pay the catch-up cost, not as a
+   requirement for correctness.
+
+3. Horizon was capped at 288 steps (3 days) purely out of caution about
+   free-tier proxy timeouts from the OLD ~380ms/step cost. With the O(1)
+   step model that ceiling was overly conservative — raised to 1344 steps
+   (14 days) at ~16ms/step (~21s of model time for the forecast loop
+   itself). If your hosting's proxy timeout is tighter than that, lower
+   MAX_STEPS below, or have the frontend request in smaller day-chunks.
+
+4. The endpoint could return a non-200 (400/500) HTTPException for things
+   like a bad NaN mid-forecast or an unparsable start time, which reads as
+   a hard "fetch failed" to a naive frontend fetch() caller. /forecast now
+   catches problems internally and always returns HTTP 200 with a
+   structured payload — either the full forecast, or a partial forecast
+   plus an "error"/"warning" field explaining what happened — so the chart
+   always has something to render instead of a blank error screen.
+------------------------------------------------------------------
 """
 
 import json
@@ -66,12 +106,13 @@ import pickle
 import threading
 import time
 import warnings
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import requests
 import tensorflow as tf
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
 from tensorflow.keras.models import Model
@@ -100,6 +141,27 @@ with open('feature_scaler.pkl', 'rb') as f:
     feature_scaler = pickle.load(f)
 with open('target_scaler.pkl', 'rb') as f:
     target_scaler = pickle.load(f)
+
+# ------------------------------------------------------------------
+# Timezone-correct "now". Everything in this file (seed data timestamps,
+# the bridge cache, the rain forecast index) is naive-datetime but implicitly
+# means "wall-clock time in CONFIG['timezone']". So "now" must be computed
+# in that timezone too, then have its tzinfo stripped — NOT pd.Timestamp.now()
+# on its own, which uses whatever timezone the host OS/container is in.
+# ------------------------------------------------------------------
+try:
+    LOCAL_TZ = ZoneInfo(TIMEZONE)
+except Exception:
+    # Defensive fallback — Rwanda has a single fixed UTC+2 offset, no DST,
+    # so this is safe even if CONFIG['timezone'] is ever missing/invalid.
+    LOCAL_TZ = ZoneInfo("Africa/Kigali")
+
+
+def now_local() -> pd.Timestamp:
+    """Current wall-clock time in CONFIG['timezone'] (Rwanda), returned as a
+    NAIVE Timestamp so it compares directly against seed/bridge data, floored
+    to the model's 15-min step grid."""
+    return pd.Timestamp.now(tz=LOCAL_TZ).tz_localize(None).floor('15min')
 
 
 # ------------------------------------------------------------------
@@ -213,6 +275,7 @@ print(f"[STARTUP BENCHMARK] Warm-up (full {LOOKBACK}-step window): "
       f"first={_warmup_first_seconds:.2f}s avg={_warmup_avg_seconds:.3f}s/call | "
       f"Step (1 new row + carried state): first={_step_first_seconds:.2f}s "
       f"avg={_step_avg_seconds:.3f}s/call", flush=True)
+print(f"[STARTUP] Resolved local timezone: {TIMEZONE} -> now_local()={now_local()}", flush=True)
 
 
 def load_seed_data() -> pd.DataFrame:
@@ -392,7 +455,7 @@ def build_initial_state_from_seed():
 
     window_scaled = feature_scaler.transform(pd.DataFrame(last_historical_data, columns=FEATURE_COLS))
     if np.isnan(window_scaled).any():
-        raise HTTPException(500, "Seed window produced NaN after scaling — check seed data.")
+        raise ValueError("Seed window produced NaN after scaling — check seed data.")
 
     pending_stage, pending_discharge, state = predict_warmup(window_scaled)
     rain_6h = last_historical_data['Rain_cumsum_6h'].iloc[-1]
@@ -406,6 +469,12 @@ def build_initial_state_from_seed():
 # the chart. Computed incrementally — later requests only extend forward
 # from wherever the cache already reached, instead of recomputing from
 # scratch every time.
+#
+# FIX: /forecast now calls this with max_steps=None (uncapped) so a single
+# request always catches the bridge all the way up to "now" — it no longer
+# depends on an external cron having run recently. HARD_MAX_CATCHUP_STEPS
+# below is only a sanity ceiling (e.g. against clock skew / bad data),
+# not the everyday operating limit.
 # ------------------------------------------------------------------
 _bridge_cache = {
     "state": None,
@@ -416,12 +485,20 @@ _bridge_cache = {
     "last_time": None,      # last timestamp the bridge has reached
     "records": [],          # list of dicts: time, stage, discharge, rain — bridged (synthetic) history
 }
-MAX_BRIDGE_STEPS_PER_CALL = 8  # ~2 hours — small safety top-up only; /advance-bridge (external cron) does the real work
+MAX_BRIDGE_STEPS_PER_CALL = 96  # used only by the optional /advance-bridge pre-warmer (~1 day/call)
+HARD_MAX_CATCHUP_STEPS = 4000   # ~41.6 days — safety ceiling for on-demand /forecast catch-up
 
 _bridge_lock = threading.Lock()
 
 
-def ensure_bridge_up_to(target_time: pd.Timestamp, rain_15m: pd.DataFrame):
+def ensure_bridge_up_to(target_time: pd.Timestamp, rain_15m: pd.DataFrame, max_steps: int | None = None):
+    """
+    Advances the bridge cache forward (real seed -> ... -> target_time),
+    reusing whatever state it already reached. With max_steps=None (used by
+    /forecast) it catches all the way up to target_time, capped only by the
+    HARD_MAX_CATCHUP_STEPS safety ceiling — this is the piece that used to
+    leave forecasts anchored on a stale timestamp.
+    """
     with _bridge_lock:
         if _bridge_cache["state"] is None:
             state, pending_stage, pending_discharge, rain_6h, rain_24h, last_time = build_initial_state_from_seed()
@@ -431,9 +508,11 @@ def ensure_bridge_up_to(target_time: pd.Timestamp, rain_15m: pd.DataFrame):
             })
 
         steps_needed = int((target_time - _bridge_cache["last_time"]).total_seconds() / 900)
-        steps_needed = min(steps_needed, MAX_BRIDGE_STEPS_PER_CALL)
+        steps_needed = max(steps_needed, 0)
+        effective_cap = HARD_MAX_CATCHUP_STEPS if max_steps is None else min(max_steps, HARD_MAX_CATCHUP_STEPS)
+        steps_needed = min(steps_needed, effective_cap)
 
-        for _ in range(max(steps_needed, 0)):
+        for _ in range(steps_needed):
             next_time = _bridge_cache["last_time"] + pd.Timedelta(minutes=15)
             (stage, discharge, rain, new_state, next_pending_stage,
              next_pending_discharge, rain_6h, rain_24h) = advance_one_step(
@@ -449,8 +528,8 @@ def ensure_bridge_up_to(target_time: pd.Timestamp, rain_15m: pd.DataFrame):
             _bridge_cache["records"].append({
                 "time": next_time, "stage_m": stage, "discharge_m3s": discharge, "rain_mm_hr": rain * 4
             })
-            if len(_bridge_cache["records"]) > 200:
-                _bridge_cache["records"] = _bridge_cache["records"][-200:]
+            if len(_bridge_cache["records"]) > 4000:
+                _bridge_cache["records"] = _bridge_cache["records"][-4000:]
 
         return dict(_bridge_cache)  # shallow copy so callers don't race with ongoing background updates
 
@@ -463,66 +542,86 @@ def ensure_bridge_up_to(target_time: pd.Timestamp, rain_15m: pd.DataFrame):
 # Render reporting the container as "Live" (that status only confirms the
 # process is running and bound to a port, not that it's responsive).
 #
-# Instead, /advance-bridge below does one small, bounded chunk of catch-up
-# work per call, and is meant to be triggered externally on a schedule (see
-# the GitHub Actions workflow) — so the heavy lifting happens in short,
-# controlled bursts rather than a thread perpetually competing for CPU.
-# With the O(1) step cost, MAX_BRIDGE_STEPS_PER_CALL could likely be raised
-# substantially (it was set to 8 based on the OLD ~380ms/step cost) — worth
-# re-tuning once you have real request-latency numbers from production.
+# /advance-bridge below remains as an OPTIONAL pre-warmer you can still hit
+# from a scheduler so the very first visitor doesn't pay the catch-up cost —
+# but it is no longer required for correctness: /forecast always catches
+# itself up to "now" regardless of whether this has run recently.
 
 
 @app.get("/advance-bridge")
 def advance_bridge():
     """
-    Advances the bridge by a small, bounded amount and returns immediately.
-    Meant to be hit periodically by an external scheduler (GitHub Actions
-    cron), NOT by visitor traffic.
+    Optional pre-warmer: advances the bridge by a small, bounded amount and
+    returns immediately. Safe to hit periodically from an external scheduler
+    (e.g. GitHub Actions cron), but /forecast no longer depends on it.
     """
-    rain_15m = get_rain_forecast()
-    target = pd.Timestamp.now().floor('15min')
-    bridge = ensure_bridge_up_to(target, rain_15m)
-    minutes_behind = round((pd.Timestamp.now() - bridge["last_time"]).total_seconds() / 60, 1)
-    return {
-        "bridge_caught_up_to": str(bridge["last_time"]),
-        "minutes_behind_now": minutes_behind,
-    }
+    try:
+        rain_15m = get_rain_forecast()
+        target = now_local()
+        bridge = ensure_bridge_up_to(target, rain_15m, max_steps=MAX_BRIDGE_STEPS_PER_CALL)
+        minutes_behind = round((now_local() - bridge["last_time"]).total_seconds() / 60, 1)
+        return {
+            "ok": True,
+            "bridge_caught_up_to": str(bridge["last_time"]),
+            "minutes_behind_now": minutes_behind,
+        }
+    except Exception as e:
+        # Never let the pre-warmer crash a scheduled job run — just report it.
+        return {"ok": False, "error": str(e)}
 
 
 @app.get("/health")
 def health():
     bridge_last_time = _bridge_cache["last_time"]
+    now = now_local()
     return {
         "status": "ok",
         "is_live_feed": IS_LIVE_FEED,
+        "timezone": TIMEZONE,
+        "now_local": str(now),
         "seed_data_last_timestamp": str(SEED_DATA.index.max()),
         "target_cols": TARGET_COLS,
         "discharge_is_log": DISCHARGE_IS_LOG,
         "bridge_caught_up_to": str(bridge_last_time) if bridge_last_time is not None else None,
         "bridge_minutes_behind_now": (
-            round((pd.Timestamp.now() - bridge_last_time).total_seconds() / 60, 1)
+            round((now - bridge_last_time).total_seconds() / 60, 1)
             if bridge_last_time is not None else None
         ),
     }
 
 
-@app.get("/forecast")
-def forecast(
-    start: str = Query(..., description="ISO timestamp, e.g. 2026-07-05T08:00:00, or 'latest'"),
-    horizon_value: int = Query(5, ge=1, le=1000),
-    horizon_unit: str = Query("hours", pattern="^(hours|days|weeks)$"),
-):
+MAX_STEPS = 1344  # 14 days at 15-min resolution. At the O(1) step-model cost (~16ms/step)
+                   # this is ~21s of pure model time for the forecast loop itself, on top of
+                   # whatever the bridge catch-up costs (small in practice — see notes above).
+                   # If your hosting's proxy/gateway timeout is tighter than that, lower this,
+                   # or have the frontend request in smaller multi-day chunks.
+
+
+def _resolve_start_time(start: str, real_data_end: pd.Timestamp):
+    """Returns (start_time_naive, error_message_or_None)."""
+    if start.lower() == "latest":
+        return now_local(), None
+    try:
+        return pd.Timestamp(start), None
+    except Exception:
+        return None, f"Could not parse start time: {start!r}. Use an ISO timestamp or 'latest'."
+
+
+def _build_forecast(start: str, horizon_value: int, horizon_unit: str):
+    """All the actual forecasting logic, isolated so the endpoint can wrap
+    it in a catch-all and always hand back a valid 200 response."""
     _req_start = time.time()
     print(f"[REQUEST] /forecast start={start} horizon={horizon_value}{horizon_unit}", flush=True)
 
-    # ---- Resolve start time ----
-    if start.lower() == "latest":
-        start_time_naive = pd.Timestamp.now().floor('15min')
-    else:
-        try:
-            start_time_naive = pd.Timestamp(start)
-        except Exception:
-            raise HTTPException(400, f"Could not parse start time: {start}")
+    real_data_end = SEED_DATA.index.max()
+    start_time_naive, start_error = _resolve_start_time(start, real_data_end)
+    if start_error:
+        return {
+            "error": start_error,
+            "requested_start": start,
+            "recent_history": [],
+            "forecast": [],
+        }
 
     if horizon_unit == "hours":
         total_minutes = horizon_value * 60
@@ -532,33 +631,29 @@ def forecast(
         total_minutes = horizon_value * 7 * 24 * 60
     total_steps = int(total_minutes / 15)
 
-    MAX_STEPS = 288  # 3 days at 15-min resolution — kept deliberately bounded so a single
-                      # request can't run long enough to risk a proxy/gateway timeout on free hosting
+    truncated_horizon = False
     if total_steps > MAX_STEPS:
-        raise HTTPException(
-            400,
-            f"Requested horizon ({total_steps} steps) exceeds the maximum of {MAX_STEPS} "
-            f"steps (~7 days) supported per request."
-        )
+        total_steps = MAX_STEPS
+        truncated_horizon = True
 
-    _t = time.time()
     rain_15m = get_rain_forecast()
-    print(f"[TIMING] get_rain_forecast: {time.time() - _t:.2f}s", flush=True)
 
-    real_data_end = SEED_DATA.index.max()
-    data_gap_minutes = max((start_time_naive - real_data_end).total_seconds() / 60, 0)
-    requested_start_time = start_time_naive  # keep the original ask for reporting, in case we fall back
-    still_catching_up = False
+    requested_start_time = start_time_naive  # keep the original ask for reporting
 
     if start_time_naive <= real_data_end:
         # Requested start falls within real data — no bridging needed, seed directly from it.
         seed_source = SEED_DATA[SEED_DATA.index <= start_time_naive]
         if len(seed_source) < LOOKBACK:
-            raise HTTPException(
-                400,
-                f"Not enough history before {start_time_naive} — need {LOOKBACK} rows, "
-                f"have {len(seed_source)}. Earliest usable start is {SEED_DATA.index[LOOKBACK]}."
-            )
+            return {
+                "error": (
+                    f"Not enough history before {start_time_naive} — need {LOOKBACK} rows, "
+                    f"have {len(seed_source)}. Earliest usable start is "
+                    f"{SEED_DATA.index[LOOKBACK] if len(SEED_DATA) > LOOKBACK else 'unavailable'}."
+                ),
+                "requested_start": requested_start_time.isoformat(),
+                "recent_history": [],
+                "forecast": [],
+            }
         last_historical_data = seed_source[FEATURE_COLS].iloc[-LOOKBACK:].copy()
         if last_historical_data.isna().any().any():
             last_historical_data = last_historical_data.ffill().bfill()
@@ -567,37 +662,47 @@ def forecast(
         rain_6h = last_historical_data['Rain_cumsum_6h'].iloc[-1]
         rain_24h = last_historical_data['Rain_cumsum_24h'].iloc[-1]
         recent_context = [
-            {"time": t.isoformat(), "stage_m": round(row.Stage_m, 4), "discharge_m3s": round(row.Discharge_m3s, 4)}
+            {
+                "time": t.isoformat(), "stage_m": round(row.Stage_m, 4),
+                "discharge_m3s": round(row.Discharge_m3s, 4), "source": "seed",
+            }
             for t, row in seed_source[['Stage_m', 'Discharge_m3s']].iloc[-32:].iterrows()
         ]
+        bridged = False
+        still_catching_up = False
     else:
-        # Requested start is beyond real data — use the bridge (built mostly by
-        # the background warmup worker; this only tops up any small residual gap).
+        # Requested start (typically "now") is beyond the static seed data —
+        # always fully catch the bridge up to it here, rather than trusting
+        # an external cron to have already done so.
         _t = time.time()
-        bridge = ensure_bridge_up_to(start_time_naive, rain_15m)
-        print(f"[TIMING] ensure_bridge_up_to: {time.time() - _t:.2f}s", flush=True)
+        bridge = ensure_bridge_up_to(start_time_naive, rain_15m, max_steps=None)
+        print(f"[TIMING] ensure_bridge_up_to (full catch-up): {time.time() - _t:.2f}s", flush=True)
         current_state = bridge["state"]
         pending_stage = bridge["pending_stage"]
         pending_discharge = bridge["pending_discharge"]
         rain_6h = bridge["rain_6h"]
         rain_24h = bridge["rain_24h"]
 
-        # If the background worker hasn't caught all the way up yet (e.g. right
-        # after a fresh deploy), forecast from wherever the bridge actually is
-        # rather than silently pretending we reached the requested start.
         actual_anchor_time = bridge["last_time"]
-        if actual_anchor_time < start_time_naive:
-            still_catching_up = True
+        # Only true if the gap exceeded HARD_MAX_CATCHUP_STEPS (pathological —
+        # e.g. clock skew or a very stale deploy), not the everyday case.
+        still_catching_up = actual_anchor_time < start_time_naive
+        if still_catching_up:
             start_time_naive = actual_anchor_time
 
+        bridged = True
         recent_context = [
-            {"time": r["time"].isoformat(), "stage_m": round(r["stage_m"], 4), "discharge_m3s": round(r["discharge_m3s"], 4)}
+            {
+                "time": r["time"].isoformat(), "stage_m": round(r["stage_m"], 4),
+                "discharge_m3s": round(r["discharge_m3s"], 4), "source": "bridged",
+            }
             for r in bridge["records"][-32:]
         ]
 
     # ---- Recursive forecast loop for the visitor's actual requested horizon ----
     _t = time.time()
     records = []
+    truncated_at_step = None
     for step in range(1, total_steps + 1):
         pred_time = start_time_naive + pd.Timedelta(minutes=15 * step)
         try:
@@ -606,7 +711,10 @@ def forecast(
                 current_state, pending_stage, pending_discharge, rain_6h, rain_24h, pred_time, rain_15m
             )
         except ValueError:
-            raise HTTPException(500, f"Model produced NaN at step {step} ({pred_time}).")
+            # Model produced NaN mid-forecast — stop here and return whatever
+            # was produced so far instead of failing the whole request.
+            truncated_at_step = step
+            break
 
         stage_unc = TEST_RMSE_STAGE * np.sqrt(step)
         discharge_unc = TEST_RMSE_DISCHARGE * np.sqrt(step)
@@ -623,19 +731,62 @@ def forecast(
         })
 
     _loop_seconds = time.time() - _t
-    print(f"[TIMING] forecast loop ({total_steps} steps): {_loop_seconds:.2f}s "
-          f"({_loop_seconds/max(total_steps,1)*1000:.0f}ms/step)", flush=True)
+    print(f"[TIMING] forecast loop ({len(records)} steps): {_loop_seconds:.2f}s "
+          f"({_loop_seconds/max(len(records),1)*1000:.0f}ms/step)", flush=True)
     print(f"[TIMING] TOTAL request time: {time.time() - _req_start:.2f}s", flush=True)
 
-    return {
+    result = {
         "is_live_feed": IS_LIVE_FEED,
-        "seed_data_gap_minutes": round(data_gap_minutes, 1),
-        "bridged": requested_start_time > real_data_end,
+        "timezone": TIMEZONE,
+        "now_local": now_local().isoformat(),
+        "seed_data_last_timestamp": real_data_end.isoformat(),
+        "bridged": bridged,
         "still_catching_up": still_catching_up,
         "requested_start": requested_start_time.isoformat(),
         "forecast_start": start_time_naive.isoformat(),
         "horizon_value": horizon_value,
         "horizon_unit": horizon_unit,
+        "horizon_truncated_to_max": truncated_horizon,
+        "max_horizon_steps": MAX_STEPS,
         "recent_history": recent_context,
         "forecast": records,
     }
+    if truncated_at_step is not None:
+        result["warning"] = (
+            f"Forecast stopped early at step {truncated_at_step} "
+            f"({total_steps - truncated_at_step} of {total_steps} steps missing) "
+            f"due to a numerical issue mid-forecast."
+        )
+    if still_catching_up:
+        result["warning"] = result.get("warning", "") + (
+            " Bridge could not fully catch up to the requested start within the "
+            "safety limit; forecast is anchored at the latest point it reached."
+        ).strip()
+    return result
+
+
+@app.get("/forecast")
+def forecast(
+    start: str = Query("latest", description="ISO timestamp, or 'latest' (default) for right now, Rwanda time"),
+    horizon_value: int = Query(5, ge=1, le=10000),
+    horizon_unit: str = Query("hours", pattern="^(hours|days|weeks)$"),
+):
+    """
+    Always returns HTTP 200 with a JSON body — even on bad input or an
+    internal hiccup — so the frontend always has something to render instead
+    of a failed fetch(). Check the "error"/"warning" fields for problems.
+    """
+    try:
+        return _build_forecast(start, horizon_value, horizon_unit)
+    except Exception as e:
+        print(f"[ERROR] /forecast failed unexpectedly: {e!r}", flush=True)
+        return {
+            "error": f"Forecast temporarily unavailable: {e}",
+            "timezone": TIMEZONE,
+            "now_local": now_local().isoformat(),
+            "requested_start": start,
+            "horizon_value": horizon_value,
+            "horizon_unit": horizon_unit,
+            "recent_history": [],
+            "forecast": [],
+        }
