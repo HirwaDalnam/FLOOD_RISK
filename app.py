@@ -238,11 +238,10 @@ _bridge_cache = {
     "last_time": None,      # last timestamp the bridge has reached
     "records": [],          # list of dicts: time, stage, discharge, rain — bridged (synthetic) history
 }
-MAX_BRIDGE_STEPS_PER_CALL = 40  # ~10 hours — safety top-up only; the background worker does the heavy lifting
+MAX_BRIDGE_STEPS_PER_CALL = 8  # ~2 hours — small safety top-up only; /advance-bridge (external cron) does the real work
 
 
 import threading
-import time as time_module
 
 _bridge_lock = threading.Lock()
 
@@ -278,62 +277,41 @@ def ensure_bridge_up_to(target_time: pd.Timestamp, rain_15m: pd.DataFrame):
         return dict(_bridge_cache)  # shallow copy so callers don't race with ongoing background updates
 
 
-def _bridge_warmup_worker():
+# The background thread approach (continuously advancing the bridge inside
+# this same process) was removed: on constrained free-tier CPU, a Python
+# thread doing repeated TensorFlow inference can starve the main request-
+# serving thread of CPU time via the GIL, even while "backing off" between
+# batches — this made the API unreachable for minutes at a time despite
+# Render reporting the container as "Live" (that status only confirms the
+# process is running and bound to a port, not that it's responsive).
+#
+# Instead, /advance-bridge below does one small, bounded chunk of catch-up
+# work per call, and is meant to be triggered externally on a schedule (see
+# the GitHub Actions workflow) — so the heavy lifting happens in short,
+# controlled bursts rather than a thread perpetually competing for CPU.
+# Instead, /advance-bridge below does one small, bounded chunk of catch-up
+# work per call, and is meant to be triggered externally on a schedule (see
+# the GitHub Actions workflow) — so the heavy lifting happens in short,
+# controlled bursts rather than a thread perpetually competing for CPU.
+
+
+@app.get("/advance-bridge")
+def advance_bridge():
     """
-    Runs in a background thread from server startup, continuously advancing
-    the bridge toward 'now' in small batches. This means the expensive
-    catch-up work happens BEFORE a visitor ever makes a request, instead of
-    blocking their browser while it computes hundreds of steps inline.
+    Advances the bridge by a small, bounded amount (~10 hours max per call)
+    and returns immediately. Meant to be hit periodically by an external
+    scheduler (GitHub Actions cron), NOT by visitor traffic — this keeps the
+    heavy recursive computation in short controlled bursts instead of a
+    continuously-running thread competing with real requests for CPU.
     """
-    while True:
-        try:
-            target = pd.Timestamp.now().floor('15min')
-            rain_15m = get_rain_forecast()
-            with _bridge_lock:
-                if _bridge_cache["window_batch"] is None:
-                    window_batch, rain_6h, rain_24h, last_time = build_initial_state_from_seed()
-                    _bridge_cache.update({
-                        "window_batch": window_batch, "rain_6h": rain_6h,
-                        "rain_24h": rain_24h, "last_time": last_time, "records": [],
-                    })
-                # Advance in small batches (not all the way to target in one go)
-                # so no single lock-held stretch is too long.
-                steps_this_round = min(
-                    int((target - _bridge_cache["last_time"]).total_seconds() / 900),
-                    40  # ~10 hours per background pass
-                )
-                for _ in range(max(steps_this_round, 0)):
-                    next_time = _bridge_cache["last_time"] + pd.Timedelta(minutes=15)
-                    stage, discharge, rain, window_batch, rain_6h, rain_24h = advance_one_step(
-                        _bridge_cache["window_batch"], _bridge_cache["rain_6h"], _bridge_cache["rain_24h"],
-                        next_time, rain_15m
-                    )
-                    _bridge_cache["window_batch"] = window_batch
-                    _bridge_cache["rain_6h"] = rain_6h
-                    _bridge_cache["rain_24h"] = rain_24h
-                    _bridge_cache["last_time"] = next_time
-                    _bridge_cache["records"].append({
-                        "time": next_time, "stage_m": stage, "discharge_m3s": discharge, "rain_mm_hr": rain * 4
-                    })
-                    if len(_bridge_cache["records"]) > 200:
-                        _bridge_cache["records"] = _bridge_cache["records"][-200:]
-        except Exception:
-            pass  # keep the warmup loop alive even if one pass fails (e.g. rain API hiccup)
-
-        # Back off once caught up — no need to hammer the CPU every 2 seconds
-        # when there's nothing left to bridge. This matters a lot on constrained
-        # free-tier CPU, where a busy background thread can starve real
-        # incoming requests and cause them to time out ("Failed to fetch").
-        with _bridge_lock:
-            minutes_behind = (
-                (pd.Timestamp.now() - _bridge_cache["last_time"]).total_seconds() / 60
-                if _bridge_cache["last_time"] is not None else 999
-            )
-        time_module.sleep(2 if minutes_behind > 20 else 60)
-
-
-_warmup_thread = threading.Thread(target=_bridge_warmup_worker, daemon=True)
-_warmup_thread.start()
+    rain_15m = get_rain_forecast()
+    target = pd.Timestamp.now().floor('15min')
+    bridge = ensure_bridge_up_to(target, rain_15m)
+    minutes_behind = round((pd.Timestamp.now() - bridge["last_time"]).total_seconds() / 60, 1)
+    return {
+        "bridge_caught_up_to": str(bridge["last_time"]),
+        "minutes_behind_now": minutes_behind,
+    }
 
 
 @app.get("/health")
