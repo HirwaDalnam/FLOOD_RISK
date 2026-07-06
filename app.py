@@ -27,6 +27,7 @@ load_seed_data() below for the one function that needs to change then).
 
 import json
 import pickle
+import time
 import warnings
 
 import numpy as np
@@ -83,6 +84,22 @@ def build_model(lookback: int, n_features: int) -> Model:
 
 model = build_model(LOOKBACK, len(FEATURE_COLS))
 model.load_weights('model.weights.h5')
+
+# One-time startup benchmark: prints raw per-step inference time to the logs.
+# This tells us definitively whether slowness is inherent to running this
+# model on this hardware, vs. something in the request-handling code around it.
+_bench_start = time.time()
+_dummy_input = np.zeros((1, LOOKBACK, len(FEATURE_COLS)), dtype=np.float32)
+model(_dummy_input, training=False)  # first call (includes any lazy tracing/compile cost)
+_first_call_seconds = time.time() - _bench_start
+
+_bench_start = time.time()
+for _ in range(5):
+    model(_dummy_input, training=False)
+_avg_call_seconds = (time.time() - _bench_start) / 5
+
+print(f"[STARTUP BENCHMARK] First inference call: {_first_call_seconds:.2f}s | "
+      f"Average of next 5 calls: {_avg_call_seconds:.3f}s/call", flush=True)
 
 
 def load_seed_data() -> pd.DataFrame:
@@ -337,6 +354,9 @@ def forecast(
     horizon_value: int = Query(5, ge=1, le=1000),
     horizon_unit: str = Query("hours", pattern="^(hours|days|weeks)$"),
 ):
+    _req_start = time.time()
+    print(f"[REQUEST] /forecast start={start} horizon={horizon_value}{horizon_unit}", flush=True)
+
     # ---- Resolve start time ----
     if start.lower() == "latest":
         start_time_naive = pd.Timestamp.now().floor('15min')
@@ -363,7 +383,10 @@ def forecast(
             f"steps (~7 days) supported per request."
         )
 
+    _t = time.time()
     rain_15m = get_rain_forecast()
+    print(f"[TIMING] get_rain_forecast: {time.time() - _t:.2f}s", flush=True)
+
     real_data_end = SEED_DATA.index.max()
     data_gap_minutes = max((start_time_naive - real_data_end).total_seconds() / 60, 0)
     requested_start_time = start_time_naive  # keep the original ask for reporting, in case we fall back
@@ -392,7 +415,9 @@ def forecast(
     else:
         # Requested start is beyond real data — use the bridge (built mostly by
         # the background warmup worker; this only tops up any small residual gap).
+        _t = time.time()
         bridge = ensure_bridge_up_to(start_time_naive, rain_15m)
+        print(f"[TIMING] ensure_bridge_up_to: {time.time() - _t:.2f}s", flush=True)
         current_window_batch = bridge["window_batch"]
         rain_6h = bridge["rain_6h"]
         rain_24h = bridge["rain_24h"]
@@ -411,6 +436,7 @@ def forecast(
         ]
 
     # ---- Recursive forecast loop for the visitor's actual requested horizon ----
+    _t = time.time()
     records = []
     for step in range(1, total_steps + 1):
         pred_time = start_time_naive + pd.Timedelta(minutes=15 * step)
@@ -428,12 +454,17 @@ def forecast(
             "time": pred_time.isoformat(),
             "predicted_stage_m": round(stage, 4),
             "stage_upper_m": round(stage + stage_unc, 4),
-            "stage_lower_m": round(stage - stage_unc, 4),
+            "stage_lower_m": round(max(stage - stage_unc, 0), 4),
             "predicted_discharge_m3s": round(discharge, 4),
             "discharge_upper_m3s": round(discharge + discharge_unc, 4),
-            "discharge_lower_m3s": round(discharge - discharge_unc, 4),
+            "discharge_lower_m3s": round(max(discharge - discharge_unc, 0), 4),  # discharge can't be negative
             "forecasted_rain_mm_hr": round(rain * 4, 3),
         })
+
+    _loop_seconds = time.time() - _t
+    print(f"[TIMING] forecast loop ({total_steps} steps): {_loop_seconds:.2f}s "
+          f"({_loop_seconds/max(total_steps,1)*1000:.0f}ms/step)", flush=True)
+    print(f"[TIMING] TOTAL request time: {time.time() - _req_start:.2f}s", flush=True)
 
     return {
         "is_live_feed": IS_LIVE_FEED,
