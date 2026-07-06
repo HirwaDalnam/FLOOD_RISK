@@ -147,7 +147,7 @@ app = FastAPI(title="SW27 Flood Forecast API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_methods=["GET", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -320,7 +320,16 @@ def _bridge_warmup_worker():
         except Exception:
             pass  # keep the warmup loop alive even if one pass fails (e.g. rain API hiccup)
 
-        time_module.sleep(2)  # brief pause between batches so it doesn't hog CPU non-stop
+        # Back off once caught up — no need to hammer the CPU every 2 seconds
+        # when there's nothing left to bridge. This matters a lot on constrained
+        # free-tier CPU, where a busy background thread can starve real
+        # incoming requests and cause them to time out ("Failed to fetch").
+        with _bridge_lock:
+            minutes_behind = (
+                (pd.Timestamp.now() - _bridge_cache["last_time"]).total_seconds() / 60
+                if _bridge_cache["last_time"] is not None else 999
+            )
+        time_module.sleep(2 if minutes_behind > 20 else 60)
 
 
 _warmup_thread = threading.Thread(target=_bridge_warmup_worker, daemon=True)
@@ -367,7 +376,8 @@ def forecast(
         total_minutes = horizon_value * 7 * 24 * 60
     total_steps = int(total_minutes / 15)
 
-    MAX_STEPS = 672  # 7 days at 15-min resolution
+    MAX_STEPS = 288  # 3 days at 15-min resolution — kept deliberately bounded so a single
+                      # request can't run long enough to risk a proxy/gateway timeout on free hosting
     if total_steps > MAX_STEPS:
         raise HTTPException(
             400,
