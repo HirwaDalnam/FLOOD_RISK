@@ -16,3 +16,9 @@ jobs:
           curl -sf --max-time 30 https://flood-risk-sxm3.onrender.com/health \
             && echo "Ping succeeded" \
             || echo "Ping failed (server may have been cold-starting) — not treated as a failure"
+
+      - name: Advance forecast bridge (bounded, ~10h per run)
+        run: |
+          curl -sf --max-time 60 https://flood-risk-sxm3.onrender.com/advance-bridge \
+            && echo "Bridge advance succeeded" \
+            || echo "Bridge advance failed — will retry next scheduled run"
