@@ -89,7 +89,7 @@
 <div id="flood-widget">
 
   <div class="header-banner">
-    <h1>Rwandex Station Flood Forecast</h1>
+    <h1>SW27 Flood Forecast</h1>
     <p>Scenario-based LSTM forecast — jointly predicts stage and discharge from
        historical station data, not live telemetry. Rainfall inputs are live via Open-Meteo.</p>
   </div>
@@ -101,14 +101,13 @@
     </div>
     <div>
       <label for="fw-horizon-value">Horizon</label>
-      <input type="number" id="fw-horizon-value" value="5" min="1" style="width:60px;">
+      <input type="number" id="fw-horizon-value" value="5" min="1" max="72" style="width:60px;">
     </div>
     <div>
       <label for="fw-horizon-unit">Unit</label>
       <select id="fw-horizon-unit">
         <option value="hours">Hours</option>
         <option value="days">Days</option>
-        <option value="weeks">Weeks</option>
       </select>
     </div>
     <button id="fw-submit">Run Forecast</button>
@@ -118,8 +117,9 @@
   <div id="fw-chart"></div>
 
   <p class="cold-start-note">
-    Note: the forecast API may take up to a minute to respond on the first request
-    after a period of inactivity (free-tier hosting spins down when idle).
+    A forecast loads automatically when this page opens. The forecast server may
+    take up to a minute to respond after a period of inactivity — the page
+    automatically retries if this happens, so no action is needed.
   </p>
 
 </div>
@@ -133,22 +133,55 @@
   now.setMinutes(Math.floor(now.getMinutes() / 15) * 15);
   startInput.value = now.toISOString().slice(0, 16);
 
-  document.getElementById('fw-submit').addEventListener('click', function () {
+  // Wake the server the moment the page loads, not when the visitor clicks —
+  // /health is lightweight, so this gets the container out of its cold-start
+  // state well before the real (heavier) forecast request happens.
+  fetch(API_BASE_URL + "/health").catch(function () { /* ignore — real request retries anyway */ });
+
+  function fetchWithTimeout(url, timeoutMs) {
+    var controller = new AbortController();
+    var timeoutId = setTimeout(function () { controller.abort(); }, timeoutMs);
+    return fetch(url, { signal: controller.signal }).finally(function () {
+      clearTimeout(timeoutId);
+    });
+  }
+
+  function runForecast(url, statusEl, attempt) {
+    attempt = attempt || 1;
+    var TIMEOUT_MS = 45000; // generous — covers a cold-start wake-up plus computation
+
+    statusEl.textContent = attempt === 1
+      ? "Running forecast..."
+      : "Server may have been asleep — retrying (attempt " + attempt + ")...";
+
+    return fetchWithTimeout(url, TIMEOUT_MS)
+      .then(function (res) {
+        if (!res.ok) return res.json().then(function (e) { throw new Error(e.detail || ("API error " + res.status)); });
+        return res.json();
+      })
+      .catch(function (err) {
+        var isNetworkOrTimeout = err.name === 'AbortError' || err.message === 'Failed to fetch';
+        if (isNetworkOrTimeout && attempt < 3) {
+          // Cold-start failures usually succeed on retry once the container is warm.
+          return new Promise(function (resolve) { setTimeout(resolve, 3000); })
+            .then(function () { return runForecast(url, statusEl, attempt + 1); });
+        }
+        throw isNetworkOrTimeout
+          ? new Error("Couldn't reach the forecast server after " + attempt + " attempts. It may be waking up from idle — please try again in a moment.")
+          : err;
+      });
+  }
+
+  function triggerForecast() {
     var start = document.getElementById('fw-start').value;
     var horizonValue = document.getElementById('fw-horizon-value').value;
     var horizonUnit = document.getElementById('fw-horizon-unit').value;
     var statusEl = document.getElementById('fw-status');
 
-    statusEl.textContent = "Running forecast... (may take up to a minute if the API was idle)";
-
     var url = API_BASE_URL + "/forecast?start=" + encodeURIComponent(start) +
               "&horizon_value=" + horizonValue + "&horizon_unit=" + horizonUnit;
 
-    fetch(url)
-      .then(function (res) {
-        if (!res.ok) return res.json().then(function(e){ throw new Error(e.detail || ("API error " + res.status)); });
-        return res.json();
-      })
+    runForecast(url, statusEl)
       .then(function (data) {
         var gapNote = "";
         if (data.still_catching_up) {
@@ -216,7 +249,13 @@
       .catch(function (err) {
         statusEl.textContent = "Error: " + err.message;
       });
-  });
+  }
+
+  document.getElementById('fw-submit').addEventListener('click', triggerForecast);
+
+  // Show a default forecast immediately on page load, so visitors see real
+  // data right away instead of a blank chart waiting for a click.
+  triggerForecast();
 })();
 </script>
 
