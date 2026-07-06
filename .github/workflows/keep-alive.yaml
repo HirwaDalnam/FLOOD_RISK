@@ -1,0 +1,18 @@
+name: Keep Render API awake
+
+on:
+  schedule:
+    # Every 10 minutes. Render's free tier sleeps after 15 minutes of no
+    # traffic, so this stays comfortably under that threshold.
+    - cron: '*/10 * * * *'
+  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab too
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        run: |
+          curl -sf --max-time 30 https://flood-risk-sxm3.onrender.com/health \
+            && echo "Ping succeeded" \
+            || echo "Ping failed (server may have been cold-starting) — not treated as a failure"
