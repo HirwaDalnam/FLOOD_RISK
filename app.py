@@ -109,6 +109,39 @@ def load_seed_data() -> pd.DataFrame:
 SEED_DATA = load_seed_data()
 IS_LIVE_FEED = False  # flip to True once load_seed_data() pulls real-time telemetry
 
+# Simple TTL cache for the rainfall forecast — it doesn't meaningfully change
+# minute-to-minute, so refetching it on every request just adds network
+# latency for no benefit. Refreshed at most once every 10 minutes.
+_rain_cache = {"data": None, "fetched_at": None}
+RAIN_CACHE_TTL_SECONDS = 600
+
+def get_rain_forecast() -> pd.DataFrame:
+    now = pd.Timestamp.now()
+    if (_rain_cache["data"] is not None and _rain_cache["fetched_at"] is not None
+            and (now - _rain_cache["fetched_at"]).total_seconds() < RAIN_CACHE_TTL_SECONDS):
+        return _rain_cache["data"]
+
+    forecast_url = (
+        f"https://api.open-meteo.com/v1/forecast?latitude={LAT}&longitude={LON}"
+        f"&hourly=precipitation&timezone={TIMEZONE.replace('/', '%2F')}"
+    )
+    try:
+        f_response = requests.get(forecast_url, timeout=10).json()
+        rain_times = pd.to_datetime(f_response['hourly']['time'])
+        rain_forecast_df = pd.DataFrame(
+            {'Precipitation_mm': f_response['hourly']['precipitation']}, index=rain_times
+        )
+        rain_forecast_df['Precipitation_mm'] = (
+            rain_forecast_df['Precipitation_mm'].ffill().bfill().fillna(0.0)
+        )
+        rain_15m = rain_forecast_df.resample('15min').ffill() / 4
+    except Exception:
+        rain_15m = pd.DataFrame(columns=['Precipitation_mm'])
+
+    _rain_cache["data"] = rain_15m
+    _rain_cache["fetched_at"] = now
+    return rain_15m
+
 app = FastAPI(title="SW27 Flood Forecast API")
 
 app.add_middleware(
@@ -119,10 +152,20 @@ app.add_middleware(
 )
 
 
+import tensorflow as tf
+
+
 def predict_step(window_batch: np.ndarray) -> tuple[float, float]:
-    """Returns (predicted_stage_m, predicted_discharge_m3s) in REAL units."""
-    stage_arr, discharge_arr = model.predict(window_batch, verbose=0)
-    predicted_scaled = np.array([stage_arr[0][0], discharge_arr[0][0]])
+    """Returns (predicted_stage_m, predicted_discharge_m3s) in REAL units.
+
+    Uses a direct model call (model(x, training=False)) rather than
+    model.predict() — .predict() carries per-call overhead (progress bar
+    setup, callback handling) that's negligible for one call but adds up
+    fast across a multi-step recursive forecast loop.
+    """
+    x = tf.convert_to_tensor(window_batch, dtype=tf.float32)
+    stage_arr, discharge_arr = model(x, training=False)
+    predicted_scaled = np.array([stage_arr.numpy()[0][0], discharge_arr.numpy()[0][0]])
 
     if np.isnan(predicted_scaled).any():
         raise ValueError("NaN in model output")
@@ -201,23 +244,8 @@ def forecast(
     rain_6h = last_historical_data['Rain_cumsum_6h'].iloc[-1]
     rain_24h = last_historical_data['Rain_cumsum_24h'].iloc[-1]
 
-    # ---- Live rainfall forecast (this part IS genuinely live) ----
-    forecast_url = (
-        f"https://api.open-meteo.com/v1/forecast?latitude={LAT}&longitude={LON}"
-        f"&hourly=precipitation&timezone={TIMEZONE.replace('/', '%2F')}"
-    )
-    try:
-        f_response = requests.get(forecast_url, timeout=10).json()
-        rain_times = pd.to_datetime(f_response['hourly']['time'])
-        rain_forecast_df = pd.DataFrame(
-            {'Precipitation_mm': f_response['hourly']['precipitation']}, index=rain_times
-        )
-        rain_forecast_df['Precipitation_mm'] = (
-            rain_forecast_df['Precipitation_mm'].ffill().bfill().fillna(0.0)
-        )
-        rain_15m = rain_forecast_df.resample('15min').ffill() / 4
-    except Exception:
-        rain_15m = pd.DataFrame(columns=['Precipitation_mm'])
+    # ---- Live rainfall forecast (cached — see get_rain_forecast()) ----
+    rain_15m = get_rain_forecast()
 
     # ---- Recursive forecast loop ----
     records = []
