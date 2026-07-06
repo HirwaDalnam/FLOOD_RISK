@@ -238,49 +238,109 @@ _bridge_cache = {
     "last_time": None,      # last timestamp the bridge has reached
     "records": [],          # list of dicts: time, stage, discharge, rain — bridged (synthetic) history
 }
-MAX_BRIDGE_STEPS_PER_CALL = 2000  # safety cap (~20 days) in case of a clock/config issue
+MAX_BRIDGE_STEPS_PER_CALL = 40  # ~10 hours — safety top-up only; the background worker does the heavy lifting
+
+
+import threading
+import time as time_module
+
+_bridge_lock = threading.Lock()
 
 
 def ensure_bridge_up_to(target_time: pd.Timestamp, rain_15m: pd.DataFrame):
-    if _bridge_cache["window_batch"] is None:
-        window_batch, rain_6h, rain_24h, last_time = build_initial_state_from_seed()
-        _bridge_cache.update({
-            "window_batch": window_batch, "rain_6h": rain_6h,
-            "rain_24h": rain_24h, "last_time": last_time, "records": [],
-        })
+    with _bridge_lock:
+        if _bridge_cache["window_batch"] is None:
+            window_batch, rain_6h, rain_24h, last_time = build_initial_state_from_seed()
+            _bridge_cache.update({
+                "window_batch": window_batch, "rain_6h": rain_6h,
+                "rain_24h": rain_24h, "last_time": last_time, "records": [],
+            })
 
-    steps_needed = int((target_time - _bridge_cache["last_time"]).total_seconds() / 900)
-    steps_needed = min(steps_needed, MAX_BRIDGE_STEPS_PER_CALL)
+        steps_needed = int((target_time - _bridge_cache["last_time"]).total_seconds() / 900)
+        steps_needed = min(steps_needed, MAX_BRIDGE_STEPS_PER_CALL)
 
-    for _ in range(max(steps_needed, 0)):
-        next_time = _bridge_cache["last_time"] + pd.Timedelta(minutes=15)
-        stage, discharge, rain, window_batch, rain_6h, rain_24h = advance_one_step(
-            _bridge_cache["window_batch"], _bridge_cache["rain_6h"], _bridge_cache["rain_24h"],
-            next_time, rain_15m
-        )
-        _bridge_cache["window_batch"] = window_batch
-        _bridge_cache["rain_6h"] = rain_6h
-        _bridge_cache["rain_24h"] = rain_24h
-        _bridge_cache["last_time"] = next_time
-        _bridge_cache["records"].append({
-            "time": next_time, "stage_m": stage, "discharge_m3s": discharge, "rain_mm_hr": rain * 4
-        })
-        # Keep only the tail — the cache doesn't need to hold days of bridged
-        # points once they're no longer near "now"
-        if len(_bridge_cache["records"]) > 200:
-            _bridge_cache["records"] = _bridge_cache["records"][-200:]
+        for _ in range(max(steps_needed, 0)):
+            next_time = _bridge_cache["last_time"] + pd.Timedelta(minutes=15)
+            stage, discharge, rain, window_batch, rain_6h, rain_24h = advance_one_step(
+                _bridge_cache["window_batch"], _bridge_cache["rain_6h"], _bridge_cache["rain_24h"],
+                next_time, rain_15m
+            )
+            _bridge_cache["window_batch"] = window_batch
+            _bridge_cache["rain_6h"] = rain_6h
+            _bridge_cache["rain_24h"] = rain_24h
+            _bridge_cache["last_time"] = next_time
+            _bridge_cache["records"].append({
+                "time": next_time, "stage_m": stage, "discharge_m3s": discharge, "rain_mm_hr": rain * 4
+            })
+            if len(_bridge_cache["records"]) > 200:
+                _bridge_cache["records"] = _bridge_cache["records"][-200:]
 
-    return _bridge_cache
+        return dict(_bridge_cache)  # shallow copy so callers don't race with ongoing background updates
+
+
+def _bridge_warmup_worker():
+    """
+    Runs in a background thread from server startup, continuously advancing
+    the bridge toward 'now' in small batches. This means the expensive
+    catch-up work happens BEFORE a visitor ever makes a request, instead of
+    blocking their browser while it computes hundreds of steps inline.
+    """
+    while True:
+        try:
+            target = pd.Timestamp.now().floor('15min')
+            rain_15m = get_rain_forecast()
+            with _bridge_lock:
+                if _bridge_cache["window_batch"] is None:
+                    window_batch, rain_6h, rain_24h, last_time = build_initial_state_from_seed()
+                    _bridge_cache.update({
+                        "window_batch": window_batch, "rain_6h": rain_6h,
+                        "rain_24h": rain_24h, "last_time": last_time, "records": [],
+                    })
+                # Advance in small batches (not all the way to target in one go)
+                # so no single lock-held stretch is too long.
+                steps_this_round = min(
+                    int((target - _bridge_cache["last_time"]).total_seconds() / 900),
+                    40  # ~10 hours per background pass
+                )
+                for _ in range(max(steps_this_round, 0)):
+                    next_time = _bridge_cache["last_time"] + pd.Timedelta(minutes=15)
+                    stage, discharge, rain, window_batch, rain_6h, rain_24h = advance_one_step(
+                        _bridge_cache["window_batch"], _bridge_cache["rain_6h"], _bridge_cache["rain_24h"],
+                        next_time, rain_15m
+                    )
+                    _bridge_cache["window_batch"] = window_batch
+                    _bridge_cache["rain_6h"] = rain_6h
+                    _bridge_cache["rain_24h"] = rain_24h
+                    _bridge_cache["last_time"] = next_time
+                    _bridge_cache["records"].append({
+                        "time": next_time, "stage_m": stage, "discharge_m3s": discharge, "rain_mm_hr": rain * 4
+                    })
+                    if len(_bridge_cache["records"]) > 200:
+                        _bridge_cache["records"] = _bridge_cache["records"][-200:]
+        except Exception:
+            pass  # keep the warmup loop alive even if one pass fails (e.g. rain API hiccup)
+
+        time_module.sleep(2)  # brief pause between batches so it doesn't hog CPU non-stop
+
+
+_warmup_thread = threading.Thread(target=_bridge_warmup_worker, daemon=True)
+_warmup_thread.start()
 
 
 @app.get("/health")
 def health():
+    bridge_last_time = _bridge_cache["last_time"]
     return {
         "status": "ok",
         "is_live_feed": IS_LIVE_FEED,
         "seed_data_last_timestamp": str(SEED_DATA.index.max()),
         "target_cols": TARGET_COLS,
         "discharge_is_log": DISCHARGE_IS_LOG,
+        "bridge_caught_up_to": str(bridge_last_time) if bridge_last_time is not None else None,
+        "bridge_minutes_behind_now": (
+            round((pd.Timestamp.now() - bridge_last_time).total_seconds() / 60, 1)
+            if bridge_last_time is not None else None
+        ),
     }
 
 
@@ -318,6 +378,8 @@ def forecast(
     rain_15m = get_rain_forecast()
     real_data_end = SEED_DATA.index.max()
     data_gap_minutes = max((start_time_naive - real_data_end).total_seconds() / 60, 0)
+    requested_start_time = start_time_naive  # keep the original ask for reporting, in case we fall back
+    still_catching_up = False
 
     if start_time_naive <= real_data_end:
         # Requested start falls within real data — no bridging needed, seed directly from it.
@@ -340,16 +402,21 @@ def forecast(
             for t, row in seed_source[['Stage_m', 'Discharge_m3s']].iloc[-32:].iterrows()
         ]
     else:
-        # Requested start is beyond real data — bridge the gap with the model's
-        # own predictions so there's no dead space on the chart.
+        # Requested start is beyond real data — use the bridge (built mostly by
+        # the background warmup worker; this only tops up any small residual gap).
         bridge = ensure_bridge_up_to(start_time_naive, rain_15m)
         current_window_batch = bridge["window_batch"]
         rain_6h = bridge["rain_6h"]
         rain_24h = bridge["rain_24h"]
-        # Recent context is the tail of the BRIDGE (recent predicted values
-        # leading up to "now"), not days-old real readings — this is what
-        # makes the chart start near the actual call time instead of showing
-        # the whole historical record.
+
+        # If the background worker hasn't caught all the way up yet (e.g. right
+        # after a fresh deploy), forecast from wherever the bridge actually is
+        # rather than silently pretending we reached the requested start.
+        actual_anchor_time = bridge["last_time"]
+        if actual_anchor_time < start_time_naive:
+            still_catching_up = True
+            start_time_naive = actual_anchor_time
+
         recent_context = [
             {"time": r["time"].isoformat(), "stage_m": round(r["stage_m"], 4), "discharge_m3s": round(r["discharge_m3s"], 4)}
             for r in bridge["records"][-32:]
@@ -383,7 +450,9 @@ def forecast(
     return {
         "is_live_feed": IS_LIVE_FEED,
         "seed_data_gap_minutes": round(data_gap_minutes, 1),
-        "bridged": start_time_naive > real_data_end,
+        "bridged": requested_start_time > real_data_end,
+        "still_catching_up": still_catching_up,
+        "requested_start": requested_start_time.isoformat(),
         "forecast_start": start_time_naive.isoformat(),
         "horizon_value": horizon_value,
         "horizon_unit": horizon_unit,
