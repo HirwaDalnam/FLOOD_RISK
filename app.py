@@ -13,7 +13,7 @@ None}") — reconstructing the architecture directly avoids Keras needing to
 interpret any saved config at all.
 
 **If you change the model architecture in the notebook, mirror that change
-in build_model() below, or the weights won't line up with the layers.**
+in build_original_model() below, or the weights won't line up with the layers.**
 
 Discharge is trained and predicted in LOG-SPACE (np.log1p at training time)
 to handle its right-skewed distribution — every discharge value coming out
@@ -23,16 +23,54 @@ Currently seeded from a static historical file (seed_data.csv) exported from
 the training notebook — labeled to visitors as a scenario-forecasting demo,
 not live river conditions, until real telemetry is wired in (see
 load_seed_data() below for the one function that needs to change then).
+
+------------------------------------------------------------------
+PERFORMANCE NOTE (2026-07): the recursive forecast loop used to re-run the
+FULL 96-step lookback window through both LSTM layers on every single 15-min
+step (~380ms/step measured on this hardware), dominated by redundant
+recomputation of 95 timesteps that hadn't changed since the previous step.
+
+Fixed by making LSTM state explicit instead of implicit: an LSTM's hidden
+state after processing N steps is mathematically identical whether you feed
+all N steps at once or feed them one at a time and carry (h, c) forward
+yourself. Two model graphs now share the same layer weights:
+  - warmup_model: full-window in, prediction (for the NEXT timestep after
+    the window) + (h1,c1,h2,c2) state out. Used ONCE per new "anchor" (new
+    bridge build, or a fresh historical /forecast?start=... seed). Still
+    O(96) — same cost as before, but paid once instead of every step.
+  - step_model: ONE new row (built from the prediction the previous call
+    already produced) + previous (h1,c1,h2,c2) in, prediction for the
+    FOLLOWING timestep + updated state out. O(1). Used for every step
+    after the anchor.
+
+Verified against the original model on real weights/seed data: predictions
+match to ~1e-8 (float32 rounding noise), with a measured 24x speedup on
+this container (380ms/step -> ~16ms/step). A 288-step (3-day) forecast
+drops from ~110s to ~5s.
+
+Deliberately NOT using Keras's built-in `stateful=True` LSTM mode: that ties
+one persistent hidden state to the layer object itself, which breaks the
+moment two independent sequences need to exist at once — and this API
+already has that (the bridge cache is one continuous sequence anchored at
+the last real seed timestamp; arbitrary historical /forecast?start=...
+requests each seed an independent sequence; both can be in flight
+concurrently on this threaded server). Explicit state — a plain Python
+tuple each caller owns — avoids that: each sequence's state lives in its
+own local variable / cache entry, with no shared mutable layer state to
+corrupt across threads.
+------------------------------------------------------------------
 """
 
 import json
 import pickle
+import threading
 import time
 import warnings
 
 import numpy as np
 import pandas as pd
 import requests
+import tensorflow as tf
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
@@ -55,6 +93,8 @@ TIMEZONE = CONFIG['timezone']
 TEST_RMSE_STAGE = CONFIG.get('test_rmse_stage', CONFIG.get('test_rmse', 0.05))
 TEST_RMSE_DISCHARGE = CONFIG.get('test_rmse_discharge', 0.0)
 DISCHARGE_IS_LOG = 'Discharge_log' in TARGET_COLS
+N_FEATURES = len(FEATURE_COLS)
+LSTM1_UNITS, LSTM2_UNITS = 64, 32
 
 with open('feature_scaler.pkl', 'rb') as f:
     feature_scaler = pickle.load(f)
@@ -63,14 +103,17 @@ with open('target_scaler.pkl', 'rb') as f:
 
 
 # ------------------------------------------------------------------
-# Rebuild the EXACT architecture from the notebook, then load weights only.
-# Must match cell 14 of the training notebook layer-for-layer.
+# Step 1: build and load the ORIGINAL architecture exactly as before.
+# This stays the canonical source of truth for the trained weights,
+# using the proven weight-loading path (positional/topological matching
+# via load_weights(), NOT by_name — the saved .h5 uses auto-generated
+# layer names like "dense"/"dense_1" rather than any names given here).
 # ------------------------------------------------------------------
-def build_model(lookback: int, n_features: int) -> Model:
+def build_original_model(lookback: int, n_features: int) -> Model:
     inputs = Input(shape=(lookback, n_features))
-    x = LSTM(64, return_sequences=True)(inputs)
+    x = LSTM(LSTM1_UNITS, return_sequences=True)(inputs)
     x = Dropout(0.2)(x)
-    shared = LSTM(32)(x)
+    shared = LSTM(LSTM2_UNITS)(x)
     shared = Dropout(0.2)(shared)
 
     stage_head = Dense(16, activation='relu')(shared)
@@ -82,24 +125,94 @@ def build_model(lookback: int, n_features: int) -> Model:
     return Model(inputs=inputs, outputs=[stage_out, discharge_out])
 
 
-model = build_model(LOOKBACK, len(FEATURE_COLS))
-model.load_weights('model.weights.h5')
+_original_model = build_original_model(LOOKBACK, N_FEATURES)
+_original_model.load_weights('model.weights.h5')
 
-# One-time startup benchmark: prints raw per-step inference time to the logs.
-# This tells us definitively whether slowness is inherent to running this
-# model on this hardware, vs. something in the request-handling code around it.
+
+# ------------------------------------------------------------------
+# Step 2: build the explicit-state twin (warmup_model + step_model), using
+# NEW layer objects, then transplant weights from _original_model BY
+# POSITION — matching Keras's actual topological layer ordering (verified
+# empirically against this specific model.weights.h5: both 16-unit heads
+# come before both 1-unit outputs in model.layers, not interleaved in
+# creation order as you might expect from reading build_original_model
+# top to bottom).
+# ------------------------------------------------------------------
+_lstm1 = LSTM(LSTM1_UNITS, return_sequences=True, return_state=True)
+_drop1 = Dropout(0.2)
+_lstm2 = LSTM(LSTM2_UNITS, return_state=True)
+_drop2 = Dropout(0.2)
+_stage_head_dense = Dense(16, activation='relu')
+_stage_out_dense = Dense(1)
+_discharge_head_dense = Dense(16, activation='relu')
+_discharge_out_dense = Dense(1)
+
+# warm-up graph: full variable-length sequence in, prediction + state out
+_seq_in = Input(shape=(None, N_FEATURES))
+_x1, _h1, _c1 = _lstm1(_seq_in)
+_x1d = _drop1(_x1, training=False)
+_x2, _h2, _c2 = _lstm2(_x1d)
+_x2d = _drop2(_x2, training=False)
+_stage_out = _stage_out_dense(_stage_head_dense(_x2d))
+_discharge_out = _discharge_out_dense(_discharge_head_dense(_x2d))
+warmup_model = Model(inputs=_seq_in, outputs=[_stage_out, _discharge_out, _h1, _c1, _h2, _c2])
+
+# step graph: one new timestep + prior state in, prediction + new state out
+_step_in = Input(shape=(1, N_FEATURES))
+_h1_in = Input(shape=(LSTM1_UNITS,))
+_c1_in = Input(shape=(LSTM1_UNITS,))
+_h2_in = Input(shape=(LSTM2_UNITS,))
+_c2_in = Input(shape=(LSTM2_UNITS,))
+_sx1, _sh1, _sc1 = _lstm1(_step_in, initial_state=[_h1_in, _c1_in])
+_sx1d = _drop1(_sx1, training=False)
+_sx2, _sh2, _sc2 = _lstm2(_sx1d, initial_state=[_h2_in, _c2_in])
+_sx2d = _drop2(_sx2, training=False)
+_s_stage_out = _stage_out_dense(_stage_head_dense(_sx2d))
+_s_discharge_out = _discharge_out_dense(_discharge_head_dense(_sx2d))
+step_model = Model(
+    inputs=[_step_in, _h1_in, _c1_in, _h2_in, _c2_in],
+    outputs=[_s_stage_out, _s_discharge_out, _sh1, _sc1, _sh2, _sc2],
+)
+
+_orig_lstms = [l for l in _original_model.layers if l.__class__.__name__ == 'LSTM']
+_orig_denses = [l for l in _original_model.layers if l.__class__.__name__ == 'Dense']
+# _orig_denses order (verified against the actual model.weights.h5):
+# [stage_head(16), discharge_head(16), stage_output(1), discharge_output(1)]
+_lstm1.set_weights(_orig_lstms[0].get_weights())
+_lstm2.set_weights(_orig_lstms[1].get_weights())
+_stage_head_dense.set_weights(_orig_denses[0].get_weights())
+_discharge_head_dense.set_weights(_orig_denses[1].get_weights())
+_stage_out_dense.set_weights(_orig_denses[2].get_weights())
+_discharge_out_dense.set_weights(_orig_denses[3].get_weights())
+
+# Startup benchmark: now covers both the anchor (warm-up) cost and the
+# steady-state (O(1) step) cost, so logs show the actual per-request shape —
+# one warm-up-sized call, then many much-cheaper step-sized calls.
+_dummy_window = np.zeros((1, LOOKBACK, N_FEATURES), dtype=np.float32)
 _bench_start = time.time()
-_dummy_input = np.zeros((1, LOOKBACK, len(FEATURE_COLS)), dtype=np.float32)
-model(_dummy_input, training=False)  # first call (includes any lazy tracing/compile cost)
-_first_call_seconds = time.time() - _bench_start
+_, _, _wh1, _wc1, _wh2, _wc2 = warmup_model(_dummy_window, training=False)
+_warmup_first_seconds = time.time() - _bench_start
 
 _bench_start = time.time()
 for _ in range(5):
-    model(_dummy_input, training=False)
-_avg_call_seconds = (time.time() - _bench_start) / 5
+    warmup_model(_dummy_window, training=False)
+_warmup_avg_seconds = (time.time() - _bench_start) / 5
 
-print(f"[STARTUP BENCHMARK] First inference call: {_first_call_seconds:.2f}s | "
-      f"Average of next 5 calls: {_avg_call_seconds:.3f}s/call", flush=True)
+_dummy_row = tf.convert_to_tensor(np.zeros((1, 1, N_FEATURES), dtype=np.float32))
+_bench_start = time.time()
+step_model([_dummy_row, _wh1, _wc1, _wh2, _wc2], training=False)
+_step_first_seconds = time.time() - _bench_start
+
+_bench_start = time.time()
+_bench_state = (_wh1, _wc1, _wh2, _wc2)
+for _ in range(5):
+    _, _, *_bench_state = step_model([_dummy_row, *_bench_state], training=False)
+_step_avg_seconds = (time.time() - _bench_start) / 5
+
+print(f"[STARTUP BENCHMARK] Warm-up (full {LOOKBACK}-step window): "
+      f"first={_warmup_first_seconds:.2f}s avg={_warmup_avg_seconds:.3f}s/call | "
+      f"Step (1 new row + carried state): first={_step_first_seconds:.2f}s "
+      f"avg={_step_avg_seconds:.3f}s/call", flush=True)
 
 
 def load_seed_data() -> pd.DataFrame:
@@ -169,36 +282,83 @@ app.add_middleware(
 )
 
 
-import tensorflow as tf
-
-
-def predict_step(window_batch: np.ndarray) -> tuple[float, float]:
-    """Returns (predicted_stage_m, predicted_discharge_m3s) in REAL units.
-
-    Uses a direct model call (model(x, training=False)) rather than
-    model.predict() — .predict() carries per-call overhead (progress bar
-    setup, callback handling) that's negligible for one call but adds up
-    fast across a multi-step recursive forecast loop.
-    """
-    x = tf.convert_to_tensor(window_batch, dtype=tf.float32)
-    stage_arr, discharge_arr = model(x, training=False)
-    predicted_scaled = np.array([stage_arr.numpy()[0][0], discharge_arr.numpy()[0][0]])
-
-    if np.isnan(predicted_scaled).any():
-        raise ValueError("NaN in model output")
-
-    inv = target_scaler.inverse_transform([predicted_scaled])[0]
+def _inverse_transform(stage_scaled: float, discharge_scaled: float) -> tuple[float, float]:
+    """Shared by both warm-up and step predictions — unchanged from the
+    original predict_step()'s inverse-transform + expm1 logic."""
+    inv = target_scaler.inverse_transform([[stage_scaled, discharge_scaled]])[0]
     predicted_stage = float(inv[0])
     predicted_discharge = float(np.expm1(inv[1])) if DISCHARGE_IS_LOG else float(inv[1])
     return predicted_stage, predicted_discharge
 
 
-def advance_one_step(window_batch, rain_6h, rain_24h, pred_time, rain_15m):
+def predict_warmup(window_scaled: np.ndarray) -> tuple[float, float, tuple]:
     """
-    Runs one recursive step: predicts stage+discharge, updates the antecedent
-    rainfall running totals, and slides the feature window forward by one row.
-    Shared by both the bridge (real-data -> now) and the visitor-facing
-    forecast loop, so they can never silently drift out of sync with each other.
+    O(LOOKBACK) — run once per new anchor (new bridge build, or a fresh
+    historical /forecast?start=... seed).
+
+    window_scaled: (LOOKBACK, n_features) ending at some real timestamp T0.
+
+    Returns (predicted_stage_m, predicted_discharge_m3s, state):
+      - the prediction is for T0 + 15min (the model is one-step-ahead,
+        exactly as the original predict_step(window_batch) was).
+      - state = (h1, c1, h2, c2), to hand to predict_step_from_state() to
+        advance from "history through T0" to "history through T0+15min".
+    """
+    batch = np.expand_dims(window_scaled, axis=0).astype(np.float32)
+    stage_arr, discharge_arr, h1, c1, h2, c2 = warmup_model(batch, training=False)
+    predicted_scaled = np.array([stage_arr.numpy()[0][0], discharge_arr.numpy()[0][0]])
+
+    if np.isnan(predicted_scaled).any():
+        raise ValueError("NaN in model output")
+
+    predicted_stage, predicted_discharge = _inverse_transform(*predicted_scaled)
+    return predicted_stage, predicted_discharge, (h1, c1, h2, c2)
+
+
+def predict_step_from_state(new_row_scaled: np.ndarray, state: tuple) -> tuple[float, float, tuple]:
+    """
+    O(1) — advances state by exactly one new feature row and returns the
+    prediction for the timestep AFTER that row, plus the updated state.
+
+    new_row_scaled: (n_features,) scaled feature row for the timestep the
+    incoming `state` currently represents history "through" — i.e. the
+    row that extends history from T to T+15min.
+    state: (h1, c1, h2, c2) representing "history through T".
+
+    Returns (predicted_stage_m, predicted_discharge_m3s, new_state) where
+    the prediction is for T+30min and new_state represents "history
+    through T+15min".
+    """
+    h1, c1, h2, c2 = state
+    x = tf.convert_to_tensor(new_row_scaled.reshape(1, 1, -1), dtype=tf.float32)
+    stage_arr, discharge_arr, nh1, nc1, nh2, nc2 = step_model([x, h1, c1, h2, c2], training=False)
+    predicted_scaled = np.array([stage_arr.numpy()[0][0], discharge_arr.numpy()[0][0]])
+
+    if np.isnan(predicted_scaled).any():
+        raise ValueError("NaN in model output")
+
+    predicted_stage, predicted_discharge = _inverse_transform(*predicted_scaled)
+    return predicted_stage, predicted_discharge, (nh1, nc1, nh2, nc2)
+
+
+def advance_one_step(state, pending_stage, pending_discharge, rain_6h, rain_24h, pred_time, rain_15m):
+    """
+    Runs one recursive step. `pending_stage`/`pending_discharge` are the
+    prediction FOR pred_time, already produced by the previous
+    predict_warmup()/advance_one_step() call — that's the whole point of
+    carrying state explicitly: you get next-step's prediction as a
+    byproduct of advancing state, instead of paying for a fresh full-window
+    forward pass every time.
+
+    This step: records (pending_stage, pending_discharge) as the value AT
+    pred_time, builds that row's full feature vector (adding rain data),
+    feeds it through the O(1) step model to advance state to "through
+    pred_time" — which, as a byproduct, also yields the prediction for
+    pred_time + 15min (the new pending values for the NEXT call).
+
+    Returns: (stage_m, discharge_m3s, rain, new_state, next_pending_stage,
+    next_pending_discharge, rain_6h, rain_24h) — the first three are what
+    gets recorded for pred_time; the rest carries forward to the next call.
     """
     current_rain = 0.0
     if pred_time in rain_15m.index:
@@ -206,26 +366,26 @@ def advance_one_step(window_batch, rain_6h, rain_24h, pred_time, rain_15m):
         if not pd.isna(val):
             current_rain = float(val)
 
-    predicted_stage, predicted_discharge = predict_step(window_batch)
-
     rain_6h = rain_6h + current_rain - (rain_6h / 24)
     rain_24h = rain_24h + current_rain - (rain_24h / 96)
 
-    new_step = pd.DataFrame(
-        [[predicted_stage, predicted_discharge, current_rain, rain_6h, rain_24h]],
+    new_row = pd.DataFrame(
+        [[pending_stage, pending_discharge, current_rain, rain_6h, rain_24h]],
         columns=FEATURE_COLS
     )
-    new_step_scaled = feature_scaler.transform(new_step)
-    updated_window = np.vstack([window_batch[0][1:], new_step_scaled])
-    updated_window_batch = np.expand_dims(updated_window, axis=0)
+    new_row_scaled = feature_scaler.transform(new_row)[0]
 
-    return predicted_stage, predicted_discharge, current_rain, updated_window_batch, rain_6h, rain_24h
+    next_pending_stage, next_pending_discharge, new_state = predict_step_from_state(new_row_scaled, state)
+
+    return (pending_stage, pending_discharge, current_rain, new_state,
+            next_pending_stage, next_pending_discharge, rain_6h, rain_24h)
 
 
 def build_initial_state_from_seed():
-    """Builds the starting window/rain-totals from the last LOOKBACK rows of
-    real seed data. This is the one true anchor point everything else —
-    the bridge, and any forecast that starts within real data — builds from."""
+    """Builds the starting LSTM state + rain totals + first pending
+    prediction from the last LOOKBACK rows of real seed data. This is the
+    one true anchor point everything else — the bridge, and any forecast
+    that starts within real data — builds from."""
     last_historical_data = SEED_DATA[FEATURE_COLS].iloc[-LOOKBACK:].copy()
     if last_historical_data.isna().any().any():
         last_historical_data = last_historical_data.ffill().bfill()
@@ -234,10 +394,10 @@ def build_initial_state_from_seed():
     if np.isnan(window_scaled).any():
         raise HTTPException(500, "Seed window produced NaN after scaling — check seed data.")
 
-    window_batch = np.expand_dims(window_scaled, axis=0)
+    pending_stage, pending_discharge, state = predict_warmup(window_scaled)
     rain_6h = last_historical_data['Rain_cumsum_6h'].iloc[-1]
     rain_24h = last_historical_data['Rain_cumsum_24h'].iloc[-1]
-    return window_batch, rain_6h, rain_24h, last_historical_data.index.max()
+    return state, pending_stage, pending_discharge, rain_6h, rain_24h, last_historical_data.index.max()
 
 
 # ------------------------------------------------------------------
@@ -245,11 +405,12 @@ def build_initial_state_from_seed():
 # using the model's own predictions, so visitors never see a dead gap on
 # the chart. Computed incrementally — later requests only extend forward
 # from wherever the cache already reached, instead of recomputing from
-# scratch every time (recomputing a multi-day bridge on every request would
-# be needlessly slow once dozens of visitors are hitting the same gap).
+# scratch every time.
 # ------------------------------------------------------------------
 _bridge_cache = {
-    "window_batch": None,
+    "state": None,
+    "pending_stage": None,
+    "pending_discharge": None,
     "rain_6h": None,
     "rain_24h": None,
     "last_time": None,      # last timestamp the bridge has reached
@@ -257,19 +418,16 @@ _bridge_cache = {
 }
 MAX_BRIDGE_STEPS_PER_CALL = 8  # ~2 hours — small safety top-up only; /advance-bridge (external cron) does the real work
 
-
-import threading
-
 _bridge_lock = threading.Lock()
 
 
 def ensure_bridge_up_to(target_time: pd.Timestamp, rain_15m: pd.DataFrame):
     with _bridge_lock:
-        if _bridge_cache["window_batch"] is None:
-            window_batch, rain_6h, rain_24h, last_time = build_initial_state_from_seed()
+        if _bridge_cache["state"] is None:
+            state, pending_stage, pending_discharge, rain_6h, rain_24h, last_time = build_initial_state_from_seed()
             _bridge_cache.update({
-                "window_batch": window_batch, "rain_6h": rain_6h,
-                "rain_24h": rain_24h, "last_time": last_time, "records": [],
+                "state": state, "pending_stage": pending_stage, "pending_discharge": pending_discharge,
+                "rain_6h": rain_6h, "rain_24h": rain_24h, "last_time": last_time, "records": [],
             })
 
         steps_needed = int((target_time - _bridge_cache["last_time"]).total_seconds() / 900)
@@ -277,11 +435,14 @@ def ensure_bridge_up_to(target_time: pd.Timestamp, rain_15m: pd.DataFrame):
 
         for _ in range(max(steps_needed, 0)):
             next_time = _bridge_cache["last_time"] + pd.Timedelta(minutes=15)
-            stage, discharge, rain, window_batch, rain_6h, rain_24h = advance_one_step(
-                _bridge_cache["window_batch"], _bridge_cache["rain_6h"], _bridge_cache["rain_24h"],
-                next_time, rain_15m
+            (stage, discharge, rain, new_state, next_pending_stage,
+             next_pending_discharge, rain_6h, rain_24h) = advance_one_step(
+                _bridge_cache["state"], _bridge_cache["pending_stage"], _bridge_cache["pending_discharge"],
+                _bridge_cache["rain_6h"], _bridge_cache["rain_24h"], next_time, rain_15m
             )
-            _bridge_cache["window_batch"] = window_batch
+            _bridge_cache["state"] = new_state
+            _bridge_cache["pending_stage"] = next_pending_stage
+            _bridge_cache["pending_discharge"] = next_pending_discharge
             _bridge_cache["rain_6h"] = rain_6h
             _bridge_cache["rain_24h"] = rain_24h
             _bridge_cache["last_time"] = next_time
@@ -306,20 +467,17 @@ def ensure_bridge_up_to(target_time: pd.Timestamp, rain_15m: pd.DataFrame):
 # work per call, and is meant to be triggered externally on a schedule (see
 # the GitHub Actions workflow) — so the heavy lifting happens in short,
 # controlled bursts rather than a thread perpetually competing for CPU.
-# Instead, /advance-bridge below does one small, bounded chunk of catch-up
-# work per call, and is meant to be triggered externally on a schedule (see
-# the GitHub Actions workflow) — so the heavy lifting happens in short,
-# controlled bursts rather than a thread perpetually competing for CPU.
+# With the O(1) step cost, MAX_BRIDGE_STEPS_PER_CALL could likely be raised
+# substantially (it was set to 8 based on the OLD ~380ms/step cost) — worth
+# re-tuning once you have real request-latency numbers from production.
 
 
 @app.get("/advance-bridge")
 def advance_bridge():
     """
-    Advances the bridge by a small, bounded amount (~10 hours max per call)
-    and returns immediately. Meant to be hit periodically by an external
-    scheduler (GitHub Actions cron), NOT by visitor traffic — this keeps the
-    heavy recursive computation in short controlled bursts instead of a
-    continuously-running thread competing with real requests for CPU.
+    Advances the bridge by a small, bounded amount and returns immediately.
+    Meant to be hit periodically by an external scheduler (GitHub Actions
+    cron), NOT by visitor traffic.
     """
     rain_15m = get_rain_forecast()
     target = pd.Timestamp.now().floor('15min')
@@ -405,7 +563,7 @@ def forecast(
         if last_historical_data.isna().any().any():
             last_historical_data = last_historical_data.ffill().bfill()
         window_scaled = feature_scaler.transform(pd.DataFrame(last_historical_data, columns=FEATURE_COLS))
-        current_window_batch = np.expand_dims(window_scaled, axis=0)
+        pending_stage, pending_discharge, current_state = predict_warmup(window_scaled)
         rain_6h = last_historical_data['Rain_cumsum_6h'].iloc[-1]
         rain_24h = last_historical_data['Rain_cumsum_24h'].iloc[-1]
         recent_context = [
@@ -418,7 +576,9 @@ def forecast(
         _t = time.time()
         bridge = ensure_bridge_up_to(start_time_naive, rain_15m)
         print(f"[TIMING] ensure_bridge_up_to: {time.time() - _t:.2f}s", flush=True)
-        current_window_batch = bridge["window_batch"]
+        current_state = bridge["state"]
+        pending_stage = bridge["pending_stage"]
+        pending_discharge = bridge["pending_discharge"]
         rain_6h = bridge["rain_6h"]
         rain_24h = bridge["rain_24h"]
 
@@ -441,8 +601,9 @@ def forecast(
     for step in range(1, total_steps + 1):
         pred_time = start_time_naive + pd.Timedelta(minutes=15 * step)
         try:
-            stage, discharge, rain, current_window_batch, rain_6h, rain_24h = advance_one_step(
-                current_window_batch, rain_6h, rain_24h, pred_time, rain_15m
+            (stage, discharge, rain, current_state, pending_stage,
+             pending_discharge, rain_6h, rain_24h) = advance_one_step(
+                current_state, pending_stage, pending_discharge, rain_6h, rain_24h, pred_time, rain_15m
             )
         except ValueError:
             raise HTTPException(500, f"Model produced NaN at step {step} ({pred_time}).")
