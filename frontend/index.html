@@ -148,11 +148,12 @@
 
   function runForecast(url, statusEl, attempt) {
     attempt = attempt || 1;
-    var TIMEOUT_MS = 45000; // generous — covers a cold-start wake-up plus computation
+    var MAX_ATTEMPTS = 4;
+    var TIMEOUT_MS = 60000; // 60s per attempt — Render cold start + computation can genuinely take this long
 
     statusEl.textContent = attempt === 1
-      ? "Running forecast..."
-      : "Server may have been asleep — retrying (attempt " + attempt + ")...";
+      ? "Running forecast... (first load after idle can take up to a minute or two)"
+      : "Server is waking up — still trying (attempt " + attempt + " of " + MAX_ATTEMPTS + ", this is normal on a cold start)...";
 
     return fetchWithTimeout(url, TIMEOUT_MS)
       .then(function (res) {
@@ -161,13 +162,13 @@
       })
       .catch(function (err) {
         var isNetworkOrTimeout = err.name === 'AbortError' || err.message === 'Failed to fetch';
-        if (isNetworkOrTimeout && attempt < 3) {
+        if (isNetworkOrTimeout && attempt < MAX_ATTEMPTS) {
           // Cold-start failures usually succeed on retry once the container is warm.
           return new Promise(function (resolve) { setTimeout(resolve, 3000); })
             .then(function () { return runForecast(url, statusEl, attempt + 1); });
         }
         throw isNetworkOrTimeout
-          ? new Error("Couldn't reach the forecast server after " + attempt + " attempts. It may be waking up from idle — please try again in a moment.")
+          ? new Error("The server took longer than expected to respond after " + attempt + " attempts (roughly " + Math.round(attempt * (TIMEOUT_MS/1000 + 3) / 60) + " minutes). This can happen on a cold start — click 'Run Forecast' to try again.")
           : err;
       });
   }
