@@ -89,7 +89,7 @@
 <div id="flood-widget">
 
   <div class="header-banner">
-    <h1>SW27 Flood Forecast</h1>
+    <h1>Rwandex station Flood Forecast</h1>
     <p>Scenario-based LSTM forecast — jointly predicts stage and discharge from
        historical station data, not live telemetry. Rainfall inputs are live via Open-Meteo.</p>
   </div>
@@ -118,8 +118,7 @@
   <div id="fw-chart"></div>
 
   <p class="cold-start-note">
-    Note: the forecast API may take up to a minute to respond on the first request
-    after a period of inactivity (free-tier hosting spins down when idle).
+    Loading (might take few seconds)....
   </p>
 
 </div>
@@ -150,9 +149,11 @@
         return res.json();
       })
       .then(function (data) {
-        var gapNote = data.seed_data_gap_minutes > 15
-          ? " (seed data is " + Math.round(data.seed_data_gap_minutes / 60) + "h before requested start)"
-          : "";
+        var gapNote = "";
+        if (data.bridged) {
+          gapNote = " — model bridged " + Math.round(data.seed_data_gap_minutes / 60) +
+                    "h of missing recent data using its own predictions";
+        }
         statusEl.textContent = (data.is_live_feed ? "Live sensor feed" : "Historical scenario data") + gapNote;
 
         var histTimes = data.recent_history.map(function (d) { return d.time; });
@@ -218,4 +219,3 @@
 
 </body>
 </html>
-
