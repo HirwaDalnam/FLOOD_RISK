@@ -174,9 +174,10 @@
     var horizonMinutes = (parseInt(horizonValueEl.value, 10) || 0) *
       (horizonUnitEl.value === 'days' ? 1440 : 60);
     var estimatedSteps = horizonMinutes / 15;
-    // ~50ms/step budget for local hardware, floor 60s, cap 15min so a stuck
+    // ~600ms/step budget — measured locally at ~503ms/step, with headroom —
+    // floor 60s (covers cold start + tiny horizons), cap 40min so a stuck
     // request still eventually surfaces an error instead of hanging forever.
-    var TIMEOUT_MS = Math.min(Math.max(60000, estimatedSteps * 50 + 60000), 900000);
+    var TIMEOUT_MS = Math.min(Math.max(60000, estimatedSteps * 600 + 60000), 2400000);
 
     statusEl.textContent = attempt === 1
       ? "Running forecast... (first load after idle can take up to a minute or two)"
