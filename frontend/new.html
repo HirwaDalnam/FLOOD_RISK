@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SW27 Flood Forecast Dashboard</title>
+<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+<style>
+  :root {
+    --primary: #1f77b4;
+    --primary-dark: #175a8a;
+    --bg: #f4f6f8;
+    --card-bg: #ffffff;
+    --text: #333333;
+    --text-muted: #666666;
+    --border: #e1e4e8;
+    --success: #2ca02c;
+    --danger: #d62728;
+    --warning: #ff7f0e;
+    --purple: #9467bd;
+  }
+
+  body {
+    font-family: system-ui, -apple-system, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    margin: 0;
+    padding: 24px 16px;
+  }
+
+  #dashboard-container {
+    max-width: 1200px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  .header-banner {
+    background: linear-gradient(135deg, #0d3b5c 0%, var(--primary) 60%, #3fa9d6 100%);
+    border-radius: 12px;
+    padding: 24px;
+    color: #fff;
+    box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+  }
+
+  .header-banner h1 {
+    margin: 0 0 6px 0;
+    font-size: 1.6em;
+    font-weight: 700;
+  }
+
+  .header-banner p {
+    margin: 0;
+    opacity: 0.9;
+    font-size: 0.9em;
+    line-height: 1.4;
+  }
+
+  /* Configuration and Alert Layout */
+  .config-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 20px;
+  }
+  @media (min-width: 768px) {
+    .config-grid { grid-template-columns: 2fr 1fr; }
+  }
+
+  .panel {
+    background: var(--card-bg);
+    padding: 20px;
+    border-radius: 12px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.04);
+    border: 1px solid var(--border);
+  }
+
+  .panel-title {
+    margin: 0 0 14px 0;
+    font-size: 0.95em;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    font-weight: 600;
+  }
+
+  .controls-form {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+    align-items: flex-end;
+  }
+
+  .input-group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    flex: 1;
+    min-width: 140px;
+  }
+
+  .input-group label {
+    font-size: 0.85em;
+    font-weight: 500;
+    color: var(--text-muted);
+  }
+
+  .input-group input, .input-group select {
+    padding: 8px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 0.95em;
+    background: #fafbfc;
+    transition: border-color 0.2s;
+  }
+
+  .input-group input:focus, .input-group select:focus {
+    border-color: var(--primary);
+    outline: none;
+    background: #fff;
+  }
+
+  #fw-submit {
+    padding: 10px 24px;
+    background: var(--primary);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 0.95em;
+    transition: background 0.2s;
+    height: 38px;
+  }
+
+  #fw-submit:hover { background: var(--primary-dark); }
+  #fw-submit:disabled { background: #a2c4dd; cursor: not-allowed; }
+
+  /* Notification Alerts */
+  .alert-zone {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+    padding: 20px;
+    border-radius: 12px;
+    font-weight: 500;
+    transition: all 0.3s ease;
+  }
+
+  .alert-safe {
+    background: #eef9ee;
+    border: 1px solid #b2dba1;
+    color: #1e5a1e;
+  }
+
+  .alert-danger {
+    background: #fdf2f2;
+    border: 1px solid #f5c6cb;
+    color: #721c24;
+    animation: pulse 2s infinite;
+  }
+
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(214, 39, 40, 0.4); }
+    70% { box-shadow: 0 0 0 10px rgba(214, 39, 40, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(214, 39, 40, 0); }
+  }
+
+  .alert-zone .icon { font-size: 2em; margin-bottom: 6px; }
+  .alert-zone .msg { font-size: 0.95em; line-height: 1.4; }
+
+  /* Metrics Widget Grid */
+  .metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+  }
+
+  .widget-card {
+    background: var(--card-bg);
+    padding: 16px;
+    border-radius: 12px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.04);
+    border: 1px solid var(--border);
+    border-left: 4px solid var(--primary);
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+  }
+
+  .widget-card.stage-card { border-left-color: var(--danger); }
+  .widget-card.discharge-card { border-left-color: var(--purple); }
+  .widget-card.rain-card { border-left-color: var(--success); }
+
+  .widget-title {
+    font-size: 0.8em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+
+  .widget-value {
+    font-size: 1.6em;
+    font-weight: 700;
+    color: var(--text);
+    margin: 4px 0;
+  }
+
+  .widget-meta {
+    font-size: 0.75em;
+    color: var(--text-muted);
+    line-height: 1.3;
+  }
+
+  /* Main Visualization Chart */
+  #fw-status {
+    font-size: 0.85em;
+    color: var(--text-muted);
+    background: #eef2f5;
+    padding: 8px 16px;
+    border-radius: 6px;
+    border-left: 3px solid var(--primary);
+  }
+
+  #fw-chart {
+    width: 100%;
+    height: 700px;
+    background: var(--card-bg);
+    border-radius: 12px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.04);
+    border: 1px solid var(--border);
+  }
+
+  .cold-start-note {
+    font-size: 0.8em;
+    color: var(--text-muted);
+    text-align: center;
+    margin: 0;
+    padding: 0 20px;
+  }
+</style>
+</head>
+<body>
+
+<div id="dashboard-container">
+
+  <!-- Header Section -->
+  <div class="header-banner">
+    <h1>SW27 Flood Forecast & Risk Dashboard</h1>
+    <p>Scenario-based LSTM modeling engine. Jointly references historical stage metrics and real-time precipitation timelines from Open-Meteo to build proactive watershed profiles[cite: 1].</p>
+  </div>
+
+  <!-- Parameter Controls & Risk Settings -->
+  <div class="config-grid">
+    <div class="panel">
+      <div class="panel-title">Inference & Scenario Configurations</div>
+      <div class="controls-form">
+        <div class="input-group">
+          <label for="fw-start">Start Initialization Time</label>
+          <input type="datetime-local" id="fw-start">
+        </div>
+        <div class="input-group" style="min-width: 90px; flex: 0.5;">
+          <label for="fw-horizon-value">Horizon Length</label>
+          <input type="number" id="fw-horizon-value" value="5" min="1" max="72">
+        </div>
+        <div class="input-group" style="min-width: 100px; flex: 0.5;">
+          <label for="fw-horizon-unit">Duration Unit</label>
+          <select id="fw-horizon-unit">
+            <option value="hours">Hours</option>
+            <option value="days" selected>Days</option>
+          </select>
+        </div>
+        <div class="input-group">
+          <label for="threshold-stage">Stage Alert Limit (m)</label>
+          <input type="number" id="threshold-stage" value="1.20" step="0.05" min="0">
+        </div>
+        <div class="input-group">
+          <label for="threshold-discharge">Discharge Limit (m³/s)</label>
+          <input type="number" id="threshold-discharge" value="15.0" step="0.5" min="0">
+        </div>
+        <button id="fw-submit">Run Forecast</button>
+      </div>
+    </div>
+
+    <!-- Live System Alert Banner -->
+    <div id="risk-alert-panel" class="alert-zone alert-safe">
+      <div class="icon" id="alert-icon">✓</div>
+      <div class="msg" id="alert-msg">Establishing timeline... Load system to determine hydrologic profile.</div>
+    </div>
+  </div>
+
+  <!-- Key Analytics Summary Metrics Widgets -->
+  <div class="metrics-grid">
+    <div class="widget-card stage-card">
+      <div>
+        <div class="widget-title">Peak Projected Stage</div>
+        <div class="widget-value" id="widget-stage-val">-- m</div>
+      </div>
+      <div class="widget-meta" id="widget-stage-meta">No profile loaded</div>
+    </div>
+    <div class="widget-card discharge-card">
+      <div>
+        <div class="widget-title">Peak Flow Discharge</div>
+        <div class="widget-value" id="widget-discharge-val">-- m³/s</div>
+      </div>
+      <div class="widget-meta" id="widget-discharge-meta">No profile loaded</div>
+    </div>
+    <div class="widget-card rain-card">
+      <div>
+        <div class="widget-title">Accumulated Rainfall</div>
+        <div class="widget-value" id="widget-rain-val">-- mm</div>
+      </div>
+      <div class="widget-meta" id="widget-rain-meta">Horizon total depth</div>
+    </div>
+    <div class="widget-card">
+      <div>
+        <div class="widget-title">System Status Context</div>
+        <div class="widget-value" id="widget-status-val" style="font-size: 1.25em; padding: 4px 0;">Standing By</div>
+      </div>
+      <div class="widget-meta" id="widget-status-meta">Telemetry disconnected</div>
+    </div>
+  </div>
+
+  <!-- Status Log and Graph Area -->
+  <div id="fw-status">Initializing workspace dependencies...</div>
+  <div id="fw-chart"></div>
+
+  <p class="cold-start-note">
+    <strong>System Note:</strong> The back-end execution architecture manages micro-inference caching loops[cite: 1]. Containers coming out of temporary idle states may take up to 60 seconds to process first loads[cite: 1].
+  </p>
+
+</div>
+
+<script>
+(function () {
+  var API_BASE_URL = "https://unfocused-subplot-ranked.ngrok-free.dev".trim();[cite: 1]
+  var NGROK_HEADERS = { "ngrok-skip-browser-warning": "true" };[cite: 1]
+
+  var startInput = document.getElementById('fw-start');
+  var now = new Date();
+  now.setMinutes(Math.floor(now.getMinutes() / 15) * 15);
+  startInput.value = now.toISOString().slice(0, 16);[cite: 1]
+
+  // Track global response data locally to allow dynamic threshold redrawing without refetching
+  var globalForecastCache = null;
+
+  // Wake target microservice on page entry[cite: 1]
+  fetch(API_BASE_URL + "/health", { headers: NGROK_HEADERS })[cite: 1]
+    .catch(function () { });
+
+  function fetchWithTimeout(url, timeoutMs) {[cite: 1]
+    var controller = new AbortController();[cite: 1]
+    var timeoutId = setTimeout(function () { controller.abort(); }, timeoutMs);[cite: 1]
+    return fetch(url, { signal: controller.signal, headers: NGROK_HEADERS }).finally(function () {[cite: 1]
+      clearTimeout(timeoutId);[cite: 1]
+    });
+  }
+
+  function runForecast(url, statusEl, attempt) {[cite: 1]
+    attempt = attempt || 1;[cite: 1]
+    var horizonValueEl = document.getElementById('fw-horizon-value');[cite: 1]
+    var horizonUnitEl = document.getElementById('fw-horizon-unit');[cite: 1]
+    var horizonMinutes = (parseInt(horizonValueEl.value, 10) || 0) * (horizonUnitEl.value === 'days' ? 1440 : 60);[cite: 1]
+    var estimatedSteps = horizonMinutes / 15;[cite: 1]
+    var TIMEOUT_MS = Math.min(Math.max(60000, estimatedSteps * 600 + 60000), 2400000);[cite: 1]
+
+    statusEl.textContent = "Computing recursive LSTM steps over timeline. Please wait...";
+
+    return fetchWithTimeout(url, TIMEOUT_MS)[cite: 1]
+      .then(function (res) {
+        if (!res.ok) return res.json().then(function (e) { throw new Error(e.detail || ("API error " + res.status)); });[cite: 1]
+        return res.json();[cite: 1]
+      })
+      .catch(function (err) {
+        var isNetworkOrTimeout = err.name === 'AbortError' || err.message === 'Failed to fetch';[cite: 1]
+        throw isNetworkOrTimeout
+          ? new Error("Server timeout during sequence calculation. Click 'Run Forecast' to submit another retry context.")[cite: 1]
+          : err;
+      });
+  }
+
+  var forecastInFlight = false;[cite: 1]
+
+  function triggerForecast() {
+    if (forecastInFlight) return;[cite: 1]
+    forecastInFlight = true;[cite: 1]
+
+    var submitBtn = document.getElementById('fw-submit');[cite: 1]
+    submitBtn.disabled = true;[cite: 1]
+
+    var start = document.getElementById('fw-start').value;[cite: 1]
+    var horizonValue = document.getElementById('fw-horizon-value').value;[cite: 1]
+    var horizonUnit = document.getElementById('fw-horizon-unit').value;[cite: 1]
+    var statusEl = document.getElementById('fw-status');[cite: 1]
+
+    var url = API_BASE_URL + "/forecast?start=" + encodeURIComponent(start) +[cite: 1]
+              "&horizon_value=" + horizonValue + "&horizon_unit=" + horizonUnit;[cite: 1]
+
+    runForecast(url, statusEl)[cite: 1]
+      .then(function (data) {
+        globalForecastCache = data; // Cache data globally to handle adjustments instantly
+        processAndRenderDashboard(data);
+      })
+      .catch(function (err) {
+        statusEl.textContent = "Error: " + err.message;[cite: 1]
+      })
+      .finally(function () {
+        forecastInFlight = false;[cite: 1]
+        submitBtn.disabled = false;[cite: 1]
+      });
+  }
+
+  function processAndRenderDashboard(data) {
+    var statusEl = document.getElementById('fw-status');[cite: 1]
+    var gapNote = "";[cite: 1]
+    if (data.still_catching_up) {[cite: 1]
+      gapNote = " — server is still catching up on recent history, showing the most current forecast available (try again in a minute for the latest)";[cite: 1]
+    } else if (data.bridged) {[cite: 1]
+      gapNote = " — model bridged " + Math.round(data.seed_data_gap_minutes / 60) + "h of missing recent data using its own predictions";[cite: 1]
+    }
+    statusEl.textContent = (data.is_live_feed ? "Live sensor feed" : "Historical scenario data") + gapNote;[cite: 1]
+
+    // Read user threshold values
+    var stageThreshold = parseFloat(document.getElementById('threshold-stage').value) || 0;
+    var dischargeThreshold = parseFloat(document.getElementById('threshold-discharge').value) || 0;
+
+    // Parse Series Arrays[cite: 1]
+    var histTimes = data.recent_history.map(function (d) { return d.time; });[cite: 1]
+    var histStage = data.recent_history.map(function (d) { return d.stage_m; });[cite: 1]
+    var histDischarge = data.recent_history.map(function (d) { return d.discharge_m3s; });[cite: 1]
+
+    var fcTimes = data.forecast.map(function (d) { return d.time; });[cite: 1]
+    var fcStage = data.forecast.map(function (d) { return d.predicted_stage_m; });[cite: 1]
+    var fcStageUpper = data.forecast.map(function (d) { return d.stage_upper_m; });[cite: 1]
+    var fcStageLower = data.forecast.map(function (d) { return d.stage_lower_m; });[cite: 1]
+    var fcDischarge = data.forecast.map(function (d) { return d.predicted_discharge_m3s; });[cite: 1]
+    var fcDischargeUpper = data.forecast.map(function (d) { return d.discharge_upper_m3s; });[cite: 1]
+    var fcDischargeLower = data.forecast.map(function (d) { return d.discharge_lower_m3s; });[cite: 1]
+    var fcRain = data.forecast.map(function (d) { return d.forecasted_rain_mm_hr; });[cite: 1]
+
+    // Calculate High Impact Statistics Metrics
+    var maxStage = 0, maxStageTime = "";
+    var maxDischarge = 0, maxDischargeTime = "";
+    var absoluteRainVolumeAcc = 0;
+
+    data.forecast.forEach(function (d) {
+      if (d.predicted_stage_m > maxStage) {
+        maxStage = d.predicted_stage_m;
+        maxStageTime = d.time;
+      }
+      if (d.predicted_discharge_m3s > maxDischarge) {
+        maxDischarge = d.predicted_discharge_m3s;
+        maxDischargeTime = d.time;
+      }
+      // Step delta is 15 minutes (0.25 hours). Scale back the intensity metrics to net depth.
+      absoluteRainVolumeAcc += (d.forecasted_rain_mm_hr * 0.25);
+    });
+
+    // Populate Visual Statistic Widgets
+    document.getElementById('widget-stage-val').textContent = maxStage.toFixed(2) + " m";
+    document.getElementById('widget-stage-meta').textContent = "Peak expected at: " + formatDate(maxStageTime);
+
+    document.getElementById('widget-discharge-val').textContent = maxDischarge.toFixed(1) + " m³/s";
+    document.getElementById('widget-discharge-meta').textContent = "Peak expected at: " + formatDate(maxDischargeTime);
+
+    document.getElementById('widget-rain-val').textContent = absoluteRainVolumeAcc.toFixed(1) + " mm";
+
+    var systemStatusCardVal = document.getElementById('widget-status-val');
+    var systemStatusCardMeta = document.getElementById('widget-status-meta');
+    if (data.is_live_feed) {[cite: 1]
+      systemStatusCardVal.textContent = "Live Feed";
+      systemStatusCardMeta.textContent = "Active Telemetry";
+    } else {
+      systemStatusCardVal.textContent = "Scenario mode";
+      systemStatusCardMeta.textContent = data.bridged ? "Bridged Context Interval" : "Historical Reference";[cite: 1]
+    }
+
+    // Dynamic Threshold Threat Level Detection
+    var stageBreached = maxStage > stageThreshold;
+    var dischargeBreached = maxDischarge > dischargeThreshold;
+    var alertZonePanel = document.getElementById('risk-alert-panel');
+    var alertIcon = document.getElementById('alert-icon');
+    var alertMsg = document.getElementById('alert-msg');
+
+    if (stageBreached || dischargeBreached) {
+      alertZonePanel.className = "alert-zone alert-danger";
+      alertIcon.textContent = "⚠️";
+      
+      var breachDetails = [];
+      if (stageBreached) breachDetails.push("Stage criteria limits breached (Peak: " + maxStage.toFixed(2) + "m)");
+      if (dischargeBreached) breachDetails.push("Volumetric discharge overflow thresholds breached (Peak: " + maxDischarge.toFixed(1) + "m³/s)");
+      
+      alertMsg.innerHTML = "<strong>CRITICAL RISK IDENTIFIED:</strong><br>" + breachDetails.join("<br>");
+    } else {
+      alertZonePanel.className = "alert-zone alert-safe";
+      alertIcon.textContent = "✓";
+      alertMsg.innerHTML = "<strong>HYDROLOGIC SYSTEM STABLE:</strong><br>All sequences over target horizon stay beneath baseline threat limits.";
+    }
+
+    // Build Plotly Traces[cite: 1]
+    var traces = [
+      { x: histTimes, y: histStage, name: 'Observed Stage', mode: 'lines', line: { color: '#2b6cb0', width: 2 }, xaxis: 'x', yaxis: 'y' },[cite: 1]
+      { x: fcTimes, y: fcStage, name: 'Stage Forecast', mode: 'lines', line: { color: '#d62728', width: 2, dash: 'dash' }, xaxis: 'x', yaxis: 'y' },[cite: 1]
+      { x: fcTimes.concat(fcTimes.slice().reverse()), y: fcStageUpper.concat(fcStageLower.slice().reverse()), fill: 'toself', fillcolor: 'rgba(214,39,40,0.12)', line: { color: 'transparent' }, name: 'Stage Uncertainty Interval', xaxis: 'x', yaxis: 'y' },[cite: 1]
+
+      { x: histTimes, y: histDischarge, name: 'Observed Discharge', mode: 'lines', line: { color: '#e08027', width: 2 }, xaxis: 'x2', yaxis: 'y2' },[cite: 1]
+      { x: fcTimes, y: fcDischarge, name: 'Discharge Forecast', mode: 'lines', line: { color: '#9467bd', width: 2, dash: 'dash' }, xaxis: 'x2', yaxis: 'y2' },[cite: 1]
+      { x: fcTimes.concat(fcTimes.slice().reverse()), y: fcDischargeUpper.concat(fcDischargeLower.slice().reverse()), fill: 'toself', fillcolor: 'rgba(148,103,189,0.12)', line: { color: 'transparent' }, name: 'Discharge Uncertainty Interval', xaxis: 'x2', yaxis: 'y2' },[cite: 1]
+
+      { x: fcTimes, y: fcRain, name: 'Forecasted Rain (mm/hr)', type: 'bar', marker: { color: '#2ca02c', opacity: 0.85 }, xaxis: 'x3', yaxis: 'y3' }[cite: 1]
+    ];
+
+    // Embed Dynamic Reference Threshold Lines inside Plotly Engine
+    var referenceShapes = [];
+    if (stageThreshold > 0) {
+      referenceShapes.push({
+        type: 'line', xref: 'x', yref: 'y',
+        x0: histTimes[0] || fcTimes[0], x1: fcTimes[fcTimes.length - 1],
+        y0: stageThreshold, y1: stageThreshold,
+        line: { color: 'rgba(214, 39, 40, 0.8)', width: 2, dash: 'dot' }
+      });
+    }
+    if (dischargeThreshold > 0) {
+      referenceShapes.push({
+        type: 'line', xref: 'x2', yref: 'y2',
+        x0: histTimes[0] || fcTimes[0], x1: fcTimes[fcTimes.length - 1],
+        y0: dischargeThreshold, y1: dischargeThreshold,
+        line: { color: 'rgba(148, 103, 189, 0.9)', width: 2, dash: 'dot' }
+      });
+    }
+
+    var layout = {
+      grid: { rows: 3, columns: 1, pattern: 'independent', roworder: 'top to bottom' },[cite: 1]
+      margin: { t: 40, r: 30, l: 65, b: 40 },[cite: 1]
+      hovermode: 'x unified',[cite: 1]
+      showlegend: true,[cite: 1]
+      legend: { orientation: 'h', y: -0.06, font: { size: 11 } },[cite: 1]
+      shapes: referenceShapes,
+      xaxis:  { title: '', matches: 'x3', gridcolor: '#f0f0f0' },[cite: 1]
+      xaxis2: { title: '', matches: 'x3', gridcolor: '#f0f0f0' },[cite: 1]
+      xaxis3: { title: 'Timeline Scale', gridcolor: '#f0f0f0' },
+      yaxis:  { title: 'Stage Elevation (m)', domain: [0.68, 1], gridcolor: '#f0f0f0' },[cite: 1]
+      yaxis2: { title: 'Discharge Rate (m³/s)', domain: [0.34, 0.62], gridcolor: '#f0f0f0' },[cite: 1]
+      yaxis3: { title: 'Rain (mm/hr)', domain: [0, 0.28], gridcolor: '#f0f0f0' }[cite: 1]
+    };
+
+    Plotly.newPlot('fw-chart', traces, layout, { responsive: true });[cite: 1]
+  }
+
+  function formatDate(isoString) {
+    if (!isoString) return "--";
+    var d = new Date(isoString);
+    return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) + " @ " + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+  }
+
+  // Intercept Threshold adjustments manually to update visual states instantly without hitting API
+  function reevaluateThresholdsOnFly() {
+    if (globalForecastCache) {
+      processAndRenderDashboard(globalForecastCache);
+    }
+  }
+
+  document.getElementById('fw-submit').addEventListener('click', triggerForecast);[cite: 1]
+  document.getElementById('threshold-stage').addEventListener('input', reevaluateThresholdsOnFly);
+  document.getElementById('threshold-discharge').addEventListener('input', reevaluateThresholdsOnFly);
+
+  // Initialize view context automatically on execution load[cite: 1]
+  triggerForecast();[cite: 1]
+})();
+</script>
+
+</body>
+</html>
