@@ -162,7 +162,21 @@
     var MAX_ATTEMPTS = 1; // retries were making things worse: aborting client-side doesn't
                           // stop the server from continuing that computation, so retries were
                           // literally stacking multiple expensive requests on top of each other
-    var TIMEOUT_MS = 60000; // 60s per attempt — Render cold start + computation can genuinely take this long
+
+    // Base 60s covers cold start + small horizons. For LOCAL TESTING with much
+    // larger horizons (e.g. a 30-day/2880-step request while MAX_STEPS is
+    // temporarily raised on the backend for local-only testing), a fixed 60s
+    // would abort a still-healthy request that's simply doing more steps.
+    // This does NOT make a month-long forecast fast on Render — it only stops
+    // the frontend from giving up early during local testing.
+    var horizonValueEl = document.getElementById('fw-horizon-value');
+    var horizonUnitEl = document.getElementById('fw-horizon-unit');
+    var horizonMinutes = (parseInt(horizonValueEl.value, 10) || 0) *
+      (horizonUnitEl.value === 'days' ? 1440 : 60);
+    var estimatedSteps = horizonMinutes / 15;
+    // ~50ms/step budget for local hardware, floor 60s, cap 15min so a stuck
+    // request still eventually surfaces an error instead of hanging forever.
+    var TIMEOUT_MS = Math.min(Math.max(60000, estimatedSteps * 50 + 60000), 900000);
 
     statusEl.textContent = attempt === 1
       ? "Running forecast... (first load after idle can take up to a minute or two)"
