@@ -126,7 +126,17 @@
 
 <script>
 (function () {
-  var API_BASE_URL = "  https://unfocused-subplot-ranked.ngrok-free.dev"; // e.g. https://abcd-1234.ngrok-free.dev
+  // NOTE: trimmed — a leading/trailing space in this string can cause subtle
+  // fetch failures in some browsers, so always .trim() it defensively too.
+  var API_BASE_URL = "https://unfocused-subplot-ranked.ngrok-free.dev".trim();
+
+  // ngrok's free tier serves an HTML "you are about to visit a tunnel" warning
+  // page to any request that looks like it's coming from a browser, UNLESS
+  // this header is present. Without it, every fetch() below silently gets back
+  // ngrok's interstitial HTML instead of your API's JSON — which is exactly
+  // what was causing the "server took longer than expected" error, since the
+  // response fails to parse as JSON and looks like a hung/failed request.
+  var NGROK_HEADERS = { "ngrok-skip-browser-warning": "true" };
 
   var startInput = document.getElementById('fw-start');
   var now = new Date();
@@ -136,12 +146,13 @@
   // Wake the server the moment the page loads, not when the visitor clicks —
   // /health is lightweight, so this gets the container out of its cold-start
   // state well before the real (heavier) forecast request happens.
-  fetch(API_BASE_URL + "/health").catch(function () { /* ignore — real request retries anyway */ });
+  fetch(API_BASE_URL + "/health", { headers: NGROK_HEADERS })
+    .catch(function () { /* ignore — real request retries anyway */ });
 
   function fetchWithTimeout(url, timeoutMs) {
     var controller = new AbortController();
     var timeoutId = setTimeout(function () { controller.abort(); }, timeoutMs);
-    return fetch(url, { signal: controller.signal }).finally(function () {
+    return fetch(url, { signal: controller.signal, headers: NGROK_HEADERS }).finally(function () {
       clearTimeout(timeoutId);
     });
   }
