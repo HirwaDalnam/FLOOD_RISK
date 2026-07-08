@@ -126,7 +126,7 @@
 
 <script>
 (function () {
-  var API_BASE_URL = " https://unfocused-subplot-ranked.ngrok-free.dev";
+  var API_BASE_URL = "  https://unfocused-subplot-ranked.ngrok-free.dev"; // e.g. https://abcd-1234.ngrok-free.dev
 
   var startInput = document.getElementById('fw-start');
   var now = new Date();
@@ -148,7 +148,9 @@
 
   function runForecast(url, statusEl, attempt) {
     attempt = attempt || 1;
-    var MAX_ATTEMPTS = 4;
+    var MAX_ATTEMPTS = 1; // retries were making things worse: aborting client-side doesn't
+                          // stop the server from continuing that computation, so retries were
+                          // literally stacking multiple expensive requests on top of each other
     var TIMEOUT_MS = 60000; // 60s per attempt — Render cold start + computation can genuinely take this long
 
     statusEl.textContent = attempt === 1
