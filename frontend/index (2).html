@@ -1,0 +1,883 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SW27 Flood Forecast — Station Dashboard</title>
+<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --ink: #0A1E1A;
+    --panel: #113631;
+    --panel-2: #17453E;
+    --line: #2A5850;
+    --paper: #ECE7DA;
+    --muted: #91ACA3;
+    --stage: #52C7DE;
+    --discharge: #EFA857;
+    --rain: #74D6A0;
+    --safe: #4FB980;
+    --watch: #EFA857;
+    --danger: #E85D50;
+    --danger-glow: rgba(232,93,80,0.18);
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    font-family: 'IBM Plex Sans', system-ui, sans-serif;
+    background: var(--ink);
+    background-image:
+      radial-gradient(ellipse 900px 500px at 15% -10%, rgba(82,199,222,0.10), transparent 60%),
+      radial-gradient(ellipse 700px 500px at 100% 0%, rgba(239,168,87,0.07), transparent 55%);
+    color: var(--paper);
+    margin: 0;
+    padding: 28px 18px 60px;
+  }
+
+  #dashboard { max-width: 1180px; margin: 0 auto; }
+
+  .eyebrow {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.72em;
+    letter-spacing: 0.14em;
+    color: var(--muted);
+    text-transform: uppercase;
+  }
+
+  /* ---------- Header ---------- */
+  .station-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    flex-wrap: wrap;
+    gap: 14px;
+    padding-bottom: 18px;
+    margin-bottom: 20px;
+    border-bottom: 1px solid var(--line);
+  }
+  .station-header h1 {
+    font-family: 'Oswald', sans-serif;
+    font-weight: 600;
+    font-size: 2.1em;
+    letter-spacing: 0.01em;
+    margin: 4px 0 2px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .badge {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.38em;
+    letter-spacing: 0.08em;
+    padding: 4px 9px;
+    border-radius: 100px;
+    border: 1px solid var(--line);
+    color: var(--muted);
+    vertical-align: middle;
+  }
+  .badge.live { color: var(--safe); border-color: var(--safe); }
+  .sub {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.82em;
+    color: var(--muted);
+    margin: 0;
+  }
+  .status-chip {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 10px 18px;
+    border-radius: 10px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    font-family: 'Oswald', sans-serif;
+    letter-spacing: 0.05em;
+    font-size: 0.95em;
+  }
+  .status-dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--safe);
+    box-shadow: 0 0 0 4px rgba(79,185,128,0.18);
+  }
+  .status-chip.watch .status-dot { background: var(--watch); box-shadow: 0 0 0 4px rgba(239,168,87,0.2); }
+  .status-chip.danger .status-dot { background: var(--danger); box-shadow: 0 0 0 4px rgba(232,93,80,0.22); }
+
+  /* ---------- Alerts ---------- */
+  #alert-stack { display: flex; flex-direction: column; gap: 10px; margin-bottom: 20px; }
+  .alert {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 14px 18px;
+    border-radius: 10px;
+    background: var(--danger-glow);
+    border: 1px solid rgba(232,93,80,0.5);
+  }
+  .alert.info {
+    background: rgba(82,199,222,0.08);
+    border-color: rgba(82,199,222,0.35);
+  }
+  .alert-icon { font-size: 1.3em; line-height: 1; }
+  .alert-body { flex: 1; }
+  .alert-title { font-weight: 600; font-size: 0.95em; margin: 0 0 2px; }
+  .alert-detail { font-size: 0.85em; color: var(--muted); margin: 0; }
+  .alert-countdown {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 1.05em;
+    font-weight: 600;
+    color: var(--danger);
+    white-space: nowrap;
+  }
+
+  /* ---------- Main grid ---------- */
+  .main-grid {
+    display: grid;
+    grid-template-columns: 220px 1fr;
+    gap: 18px;
+    margin-bottom: 18px;
+  }
+  @media (max-width: 760px) {
+    .main-grid { grid-template-columns: 1fr; }
+  }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 18px 20px;
+  }
+  .panel h3 {
+    font-family: 'Oswald', sans-serif;
+    font-weight: 500;
+    letter-spacing: 0.03em;
+    font-size: 0.95em;
+    margin: 0 0 4px;
+    text-transform: uppercase;
+    color: var(--paper);
+  }
+  .hint { font-size: 0.8em; color: var(--muted); margin: 0 0 14px; }
+
+  /* ---------- Gauge ---------- */
+  .gauge-card { text-align: center; }
+  #staff-gauge { width: 100%; height: auto; margin-top: 6px; }
+  .gauge-legend {
+    display: flex;
+    justify-content: center;
+    gap: 14px;
+    margin-top: 10px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.68em;
+    color: var(--muted);
+  }
+  .gauge-legend span { display: flex; align-items: center; gap: 5px; }
+  .swatch { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+
+  /* ---------- Stat cards ---------- */
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin-bottom: 18px;
+  }
+  @media (max-width: 900px) { .stat-grid { grid-template-columns: repeat(2, 1fr); } }
+
+  .stat-card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 14px 16px;
+    position: relative;
+    overflow: hidden;
+  }
+  .stat-card::before {
+    content: '';
+    position: absolute; top: 0; left: 0; bottom: 0;
+    width: 3px;
+    background: var(--accent, var(--stage));
+  }
+  .stat-label {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.68em;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin: 0 0 6px;
+  }
+  .stat-value {
+    font-family: 'Oswald', sans-serif;
+    font-size: 1.7em;
+    font-weight: 600;
+    line-height: 1;
+    margin: 0;
+  }
+  .stat-unit { font-size: 0.5em; color: var(--muted); font-weight: 400; margin-left: 3px; }
+  .stat-sub {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.72em;
+    color: var(--muted);
+    margin: 6px 0 0;
+  }
+
+  /* ---------- Threshold panel ---------- */
+  .threshold-row {
+    display: flex;
+    gap: 14px;
+    flex-wrap: wrap;
+    align-items: flex-end;
+  }
+  .threshold-row label {
+    display: block;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.75em;
+    color: var(--muted);
+    margin-bottom: 5px;
+  }
+  .threshold-row input {
+    display: block;
+    background: var(--ink);
+    border: 1px solid var(--line);
+    color: var(--paper);
+    padding: 9px 10px;
+    border-radius: 7px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.95em;
+    width: 150px;
+  }
+  .threshold-row input:focus { outline: 2px solid var(--stage); outline-offset: 1px; }
+  #th-save {
+    padding: 10px 20px;
+    background: var(--stage);
+    color: #05201f;
+    border: none;
+    border-radius: 7px;
+    font-family: 'Oswald', sans-serif;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    cursor: pointer;
+  }
+  #th-save:hover { background: #6fd4e8; }
+  #th-saved-note {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.75em;
+    color: var(--safe);
+    margin-left: 4px;
+  }
+
+  /* ---------- Controls panel ---------- */
+  .controls-panel { margin-top: 14px; }
+  .controls {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    align-items: flex-end;
+  }
+  .controls label {
+    display: block;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.75em;
+    color: var(--muted);
+    margin-bottom: 5px;
+  }
+  .controls input, .controls select {
+    padding: 8px 9px;
+    background: var(--ink);
+    border: 1px solid var(--line);
+    color: var(--paper);
+    border-radius: 7px;
+    font-family: 'IBM Plex Mono', monospace;
+  }
+  #fw-submit {
+    padding: 9px 20px;
+    background: var(--discharge);
+    color: #2b1a03;
+    border: none;
+    border-radius: 7px;
+    cursor: pointer;
+    font-family: 'Oswald', sans-serif;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+  }
+  #fw-submit:hover { background: #f6bd78; }
+  #fw-submit:disabled { opacity: 0.55; cursor: default; }
+  #fw-status {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.8em;
+    color: var(--muted);
+    margin-top: 12px;
+  }
+
+  /* ---------- Chart panel ---------- */
+  .chart-panel { padding: 10px 14px 14px; }
+  #fw-chart { width: 100%; height: 720px; }
+
+  .cold-start-note {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.72em;
+    color: var(--muted);
+    margin-top: 14px;
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<div id="dashboard">
+
+  <div class="station-header">
+    <div>
+      <div class="eyebrow">Hydrological forecast station · SW27</div>
+      <h1>SW27 <span class="badge" id="feed-badge">SCENARIO</span></h1>
+      <p class="sub" id="last-updated">No forecast run yet</p>
+    </div>
+    <div class="status-chip" id="status-chip">
+      <span class="status-dot"></span>
+      <span id="status-label">STANDBY</span>
+    </div>
+  </div>
+
+  <div id="alert-stack"></div>
+
+  <div class="main-grid">
+    <div class="gauge-card panel">
+      <h3>Stage gauge</h3>
+      <svg id="staff-gauge" viewBox="0 0 160 440"></svg>
+      <div class="gauge-legend">
+        <span><span class="swatch" style="background:var(--stage)"></span>Now</span>
+        <span><span class="swatch" style="background:var(--discharge)"></span>Peak</span>
+        <span><span class="swatch" style="background:var(--danger)"></span>Threshold</span>
+      </div>
+    </div>
+
+    <div>
+      <div class="stat-grid" id="stat-grid"></div>
+
+      <div class="panel threshold-panel">
+        <h3>Flood thresholds</h3>
+        <p class="hint">Set the levels that matter for this station. If the forecast is on track to cross either one, a warning appears above with the expected time.</p>
+        <div class="threshold-row">
+          <label for="th-stage">Stage threshold (m)
+            <input type="number" id="th-stage" step="0.1" placeholder="e.g. 3.5">
+          </label>
+          <label for="th-discharge">Discharge threshold (m³/s)
+            <input type="number" id="th-discharge" step="1" placeholder="e.g. 250">
+          </label>
+          <button id="th-save">Save thresholds</button>
+          <span id="th-saved-note"></span>
+        </div>
+      </div>
+
+      <div class="panel controls-panel">
+        <h3>Run forecast</h3>
+        <div class="controls">
+          <div>
+            <label for="fw-start">Start time</label>
+            <input type="datetime-local" id="fw-start">
+          </div>
+          <div>
+            <label for="fw-horizon-value">Horizon</label>
+            <input type="number" id="fw-horizon-value" value="5" min="1" max="72" style="width:60px;">
+          </div>
+          <div>
+            <label for="fw-horizon-unit">Unit</label>
+            <select id="fw-horizon-unit">
+              <option value="hours">Hours</option>
+              <option value="days">Days</option>
+            </select>
+          </div>
+          <button id="fw-submit">Run forecast</button>
+        </div>
+        <div id="fw-status"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="panel chart-panel">
+    <div id="fw-chart"></div>
+  </div>
+
+  <p class="cold-start-note">
+    A forecast loads automatically when this page opens. The forecast server may
+    take up to a minute to respond after a period of inactivity — the page
+    automatically retries if this happens, so no action is needed.
+  </p>
+
+</div>
+
+<script>
+(function () {
+  // NOTE: trimmed — a leading/trailing space in this string can cause subtle
+  // fetch failures in some browsers, so always .trim() it defensively too.
+  var API_BASE_URL = "https://unfocused-subplot-ranked.ngrok-free.dev".trim();
+
+  // ngrok's free tier serves an HTML "you are about to visit a tunnel" warning
+  // page to any request that looks like it's coming from a browser, UNLESS
+  // this header is present. Without it, every fetch() below silently gets back
+  // ngrok's interstitial HTML instead of your API's JSON.
+  var NGROK_HEADERS = { "ngrok-skip-browser-warning": "true" };
+
+  var THRESHOLD_KEY = "sw27_thresholds_v1";
+  var thresholds = loadThresholds();
+  var lastData = null;
+  var countdownTimer = null;
+
+  function loadThresholds() {
+    try {
+      var raw = localStorage.getItem(THRESHOLD_KEY);
+      if (!raw) return { stage: null, discharge: null };
+      var parsed = JSON.parse(raw);
+      return {
+        stage: typeof parsed.stage === 'number' ? parsed.stage : null,
+        discharge: typeof parsed.discharge === 'number' ? parsed.discharge : null
+      };
+    } catch (e) {
+      return { stage: null, discharge: null };
+    }
+  }
+
+  function saveThresholds() {
+    try { localStorage.setItem(THRESHOLD_KEY, JSON.stringify(thresholds)); } catch (e) {}
+  }
+
+  // Populate threshold inputs from any saved values.
+  var thStageInput = document.getElementById('th-stage');
+  var thDischargeInput = document.getElementById('th-discharge');
+  if (thresholds.stage !== null) thStageInput.value = thresholds.stage;
+  if (thresholds.discharge !== null) thDischargeInput.value = thresholds.discharge;
+
+  document.getElementById('th-save').addEventListener('click', function () {
+    var sVal = parseFloat(thStageInput.value);
+    var dVal = parseFloat(thDischargeInput.value);
+    thresholds.stage = isNaN(sVal) ? null : sVal;
+    thresholds.discharge = isNaN(dVal) ? null : dVal;
+    saveThresholds();
+    var note = document.getElementById('th-saved-note');
+    note.textContent = "Saved";
+    setTimeout(function () { note.textContent = ""; }, 2500);
+    if (lastData) renderDashboard(lastData); // re-evaluate against existing forecast, no refetch needed
+  });
+
+  var startInput = document.getElementById('fw-start');
+  var now = new Date();
+  now.setMinutes(Math.floor(now.getMinutes() / 15) * 15);
+  startInput.value = now.toISOString().slice(0, 16);
+
+  // Wake the server the moment the page loads, not when the visitor clicks —
+  // /health is lightweight, so this gets the container out of its cold-start
+  // state well before the real (heavier) forecast request happens.
+  fetch(API_BASE_URL + "/health", { headers: NGROK_HEADERS })
+    .catch(function () { /* ignore — real request retries anyway */ });
+
+  function fetchWithTimeout(url, timeoutMs) {
+    var controller = new AbortController();
+    var timeoutId = setTimeout(function () { controller.abort(); }, timeoutMs);
+    return fetch(url, { signal: controller.signal, headers: NGROK_HEADERS }).finally(function () {
+      clearTimeout(timeoutId);
+    });
+  }
+
+  function runForecast(url, statusEl, attempt) {
+    attempt = attempt || 1;
+    var MAX_ATTEMPTS = 1; // retries were making things worse: aborting client-side doesn't
+                          // stop the server from continuing that computation, so retries were
+                          // literally stacking multiple expensive requests on top of each other
+
+    var horizonValueEl = document.getElementById('fw-horizon-value');
+    var horizonUnitEl = document.getElementById('fw-horizon-unit');
+    var horizonMinutes = (parseInt(horizonValueEl.value, 10) || 0) *
+      (horizonUnitEl.value === 'days' ? 1440 : 60);
+    var estimatedSteps = horizonMinutes / 15;
+    // ~600ms/step budget — measured locally at ~503ms/step, with headroom —
+    // floor 60s (covers cold start + tiny horizons), cap 40min so a stuck
+    // request still eventually surfaces an error instead of hanging forever.
+    var TIMEOUT_MS = Math.min(Math.max(60000, estimatedSteps * 600 + 60000), 2400000);
+
+    statusEl.textContent = attempt === 1
+      ? "Running forecast... (first load after idle can take up to a minute or two)"
+      : "Server is waking up — still trying (attempt " + attempt + " of " + MAX_ATTEMPTS + ", this is normal on a cold start)...";
+
+    return fetchWithTimeout(url, TIMEOUT_MS)
+      .then(function (res) {
+        if (!res.ok) return res.json().then(function (e) { throw new Error(e.detail || ("API error " + res.status)); });
+        return res.json();
+      })
+      .catch(function (err) {
+        var isNetworkOrTimeout = err.name === 'AbortError' || err.message === 'Failed to fetch';
+        if (isNetworkOrTimeout && attempt < MAX_ATTEMPTS) {
+          return new Promise(function (resolve) { setTimeout(resolve, 3000); })
+            .then(function () { return runForecast(url, statusEl, attempt + 1); });
+        }
+        throw isNetworkOrTimeout
+          ? new Error("The server took longer than expected to respond after " + attempt + " attempts (roughly " + Math.round(attempt * (TIMEOUT_MS/1000 + 3) / 60) + " minutes). This can happen on a cold start — click 'Run Forecast' to try again.")
+          : err;
+      });
+  }
+
+  var forecastInFlight = false;
+
+  function triggerForecast() {
+    if (forecastInFlight) return;
+    forecastInFlight = true;
+
+    var submitBtn = document.getElementById('fw-submit');
+    submitBtn.disabled = true;
+
+    var start = document.getElementById('fw-start').value;
+    var horizonValue = document.getElementById('fw-horizon-value').value;
+    var horizonUnit = document.getElementById('fw-horizon-unit').value;
+    var statusEl = document.getElementById('fw-status');
+
+    var url = API_BASE_URL + "/forecast?start=" + encodeURIComponent(start) +
+              "&horizon_value=" + horizonValue + "&horizon_unit=" + horizonUnit;
+
+    runForecast(url, statusEl)
+      .then(function (data) {
+        var gapNote = "";
+        if (data.still_catching_up) {
+          gapNote = " — server is still catching up on recent history, showing the most current forecast available (try again in a minute for the latest)";
+        } else if (data.bridged) {
+          gapNote = " — model bridged " + Math.round(data.seed_data_gap_minutes / 60) +
+                    "h of missing recent data using its own predictions";
+        }
+        statusEl.textContent = (data.is_live_feed ? "Live sensor feed" : "Historical scenario data") + gapNote;
+
+        lastData = data;
+        renderDashboard(data);
+      })
+      .catch(function (err) {
+        statusEl.textContent = "Error: " + err.message;
+      })
+      .finally(function () {
+        forecastInFlight = false;
+        document.getElementById('fw-submit').disabled = false;
+      });
+  }
+
+  // ------------------------------------------------------------------
+  // Dashboard rendering: header badge, stat cards, alerts, gauge, chart
+  // ------------------------------------------------------------------
+  function fmt(n, digits) {
+    if (n === null || n === undefined || isNaN(n)) return "—";
+    return n.toFixed(digits === undefined ? 2 : digits);
+  }
+
+  function relativeTimeLabel(fromDate, toDate) {
+    var diffMs = toDate.getTime() - fromDate.getTime();
+    var neg = diffMs < 0;
+    diffMs = Math.abs(diffMs);
+    var totalSec = Math.floor(diffMs / 1000);
+    var d = Math.floor(totalSec / 86400);
+    var h = Math.floor((totalSec % 86400) / 3600);
+    var m = Math.floor((totalSec % 3600) / 60);
+    var s = totalSec % 60;
+    var parts = [];
+    if (d > 0) parts.push(d + "d");
+    if (h > 0 || d > 0) parts.push(h + "h");
+    parts.push(m + "m");
+    if (d === 0 && h === 0) parts.push(s + "s");
+    return (neg ? "-" : "") + parts.join(" ");
+  }
+
+  function findBreach(forecastArr, field, threshold) {
+    if (threshold === null || threshold === undefined || isNaN(threshold)) return null;
+    for (var i = 0; i < forecastArr.length; i++) {
+      if (forecastArr[i][field] >= threshold) {
+        return forecastArr[i];
+      }
+    }
+    return null;
+  }
+
+  function renderDashboard(data) {
+    // ---- Header ----
+    var feedBadge = document.getElementById('feed-badge');
+    feedBadge.textContent = data.is_live_feed ? "LIVE" : "SCENARIO";
+    feedBadge.className = "badge" + (data.is_live_feed ? " live" : "");
+    document.getElementById('last-updated').textContent =
+      "Forecast anchored at " + new Date(data.forecast_start).toLocaleString();
+
+    var history = data.recent_history || [];
+    var forecast = data.forecast || [];
+    var currentStage = history.length ? history[history.length - 1].stage_m : null;
+    var currentDischarge = history.length ? history[history.length - 1].discharge_m3s : null;
+
+    var peakStageRow = forecast.reduce(function (best, r) {
+      return (!best || r.predicted_stage_m > best.predicted_stage_m) ? r : best;
+    }, null);
+    var peakDischargeRow = forecast.reduce(function (best, r) {
+      return (!best || r.predicted_discharge_m3s > best.predicted_discharge_m3s) ? r : best;
+    }, null);
+    var totalRainMm = forecast.reduce(function (sum, r) { return sum + (r.forecasted_rain_mm_hr || 0) * 0.25; }, 0);
+
+    // ---- Breach detection ----
+    var stageBreach = findBreach(forecast, 'predicted_stage_m', thresholds.stage);
+    var dischargeBreach = findBreach(forecast, 'predicted_discharge_m3s', thresholds.discharge);
+    var stageAlreadyOver = thresholds.stage !== null && currentStage !== null && currentStage >= thresholds.stage;
+    var dischargeAlreadyOver = thresholds.discharge !== null && currentDischarge !== null && currentDischarge >= thresholds.discharge;
+
+    var zone = "safe";
+    if (stageAlreadyOver || dischargeAlreadyOver) zone = "danger";
+    else if (stageBreach || dischargeBreach) zone = "watch";
+
+    var statusChip = document.getElementById('status-chip');
+    statusChip.className = "status-chip" + (zone === "danger" ? " danger" : zone === "watch" ? " watch" : "");
+    document.getElementById('status-label').textContent =
+      zone === "danger" ? "THRESHOLD EXCEEDED" : zone === "watch" ? "THRESHOLD WATCH" : "NORMAL";
+
+    // ---- Stat cards ----
+    var cards = [
+      { label: "Current stage", value: fmt(currentStage, 2), unit: "m", accent: "var(--stage)",
+        sub: history.length ? new Date(history[history.length - 1].time).toLocaleTimeString() : "" },
+      { label: "Current discharge", value: fmt(currentDischarge, 1), unit: "m³/s", accent: "var(--discharge)",
+        sub: history.length ? new Date(history[history.length - 1].time).toLocaleTimeString() : "" },
+      { label: "Peak forecast stage", value: peakStageRow ? fmt(peakStageRow.predicted_stage_m, 2) : "—", unit: "m", accent: "var(--stage)",
+        sub: peakStageRow ? "at " + new Date(peakStageRow.time).toLocaleString() : "" },
+      { label: "Peak forecast discharge", value: peakDischargeRow ? fmt(peakDischargeRow.predicted_discharge_m3s, 1) : "—", unit: "m³/s", accent: "var(--discharge)",
+        sub: peakDischargeRow ? "at " + new Date(peakDischargeRow.time).toLocaleString() : "" },
+      { label: "Rain over horizon", value: fmt(totalRainMm, 1), unit: "mm", accent: "var(--rain)",
+        sub: forecast.length ? forecast.length + " forecast steps" : "" },
+      { label: "Horizon", value: data.horizon_value, unit: data.horizon_unit, accent: "var(--muted)",
+        sub: data.bridged ? "bridged from last real data" : "seeded from real data" }
+    ];
+
+    var statGrid = document.getElementById('stat-grid');
+    statGrid.innerHTML = cards.map(function (c) {
+      return '<div class="stat-card" style="--accent:' + c.accent + '">' +
+        '<p class="stat-label">' + c.label + '</p>' +
+        '<p class="stat-value">' + c.value + '<span class="stat-unit">' + c.unit + '</span></p>' +
+        '<p class="stat-sub">' + c.sub + '</p>' +
+        '</div>';
+    }).join('');
+
+    // ---- Alerts ----
+    var alertStack = document.getElementById('alert-stack');
+    var alertsHtml = [];
+
+    if (stageAlreadyOver) {
+      alertsHtml.push(alertHtml('danger', '⚠', 'Stage is already at or above ' + thresholds.stage + ' m',
+        'Current reading: ' + fmt(currentStage, 2) + ' m', null));
+    } else if (stageBreach) {
+      alertsHtml.push(alertHtml('danger', '⚠', 'Stage forecast to reach ' + thresholds.stage + ' m',
+        'Expected at ' + new Date(stageBreach.time).toLocaleString(), new Date(stageBreach.time)));
+    }
+
+    if (dischargeAlreadyOver) {
+      alertsHtml.push(alertHtml('danger', '⚠', 'Discharge is already at or above ' + thresholds.discharge + ' m³/s',
+        'Current reading: ' + fmt(currentDischarge, 1) + ' m³/s', null));
+    } else if (dischargeBreach) {
+      alertsHtml.push(alertHtml('danger', '⚠', 'Discharge forecast to reach ' + thresholds.discharge + ' m³/s',
+        'Expected at ' + new Date(dischargeBreach.time).toLocaleString(), new Date(dischargeBreach.time)));
+    }
+
+    if (thresholds.stage === null && thresholds.discharge === null) {
+      alertsHtml.push(alertHtml('info', 'ℹ', 'No thresholds set',
+        'Add a stage or discharge threshold below to get warned when the forecast is on track to cross it.', null));
+    }
+
+    alertStack.innerHTML = alertsHtml.join('');
+
+    if (countdownTimer) clearInterval(countdownTimer);
+    var countdownEls = alertStack.querySelectorAll('[data-breach-time]');
+    if (countdownEls.length) {
+      countdownTimer = setInterval(function () {
+        countdownEls.forEach(function (el) {
+          var t = new Date(el.getAttribute('data-breach-time'));
+          el.textContent = "in " + relativeTimeLabel(new Date(), t);
+        });
+      }, 1000);
+    }
+
+    // ---- Gauge ----
+    drawStaffGauge(history, forecast, currentStage, peakStageRow, thresholds.stage);
+
+    // ---- Chart ----
+    drawChart(data);
+  }
+
+  function alertHtml(kind, icon, title, detail, breachTime) {
+    var countdownSpan = breachTime
+      ? '<span class="alert-countdown" data-breach-time="' + breachTime.toISOString() + '">calculating…</span>'
+      : '';
+    return '<div class="alert ' + (kind === 'info' ? 'info' : '') + '">' +
+      '<span class="alert-icon">' + icon + '</span>' +
+      '<div class="alert-body"><p class="alert-title">' + title + '</p><p class="alert-detail">' + detail + '</p></div>' +
+      countdownSpan +
+      '</div>';
+  }
+
+  function niceStep(range) {
+    if (range <= 2) return 0.25;
+    if (range <= 5) return 0.5;
+    if (range <= 10) return 1;
+    if (range <= 25) return 2;
+    return 5;
+  }
+
+  function drawStaffGauge(history, forecast, currentStage, peakStageRow, stageThreshold) {
+    var svg = document.getElementById('staff-gauge');
+    var W = 160, H = 440;
+    var topPad = 26, botPad = 26;
+    var colX = 55, colW = 46;
+
+    var values = [];
+    history.forEach(function (h) { values.push(h.stage_m); });
+    forecast.forEach(function (f) { values.push(f.predicted_stage_m); });
+    if (stageThreshold !== null && !isNaN(stageThreshold)) values.push(stageThreshold);
+    if (!values.length) values = [0, 1];
+
+    var dataMin = Math.min.apply(null, values);
+    var dataMax = Math.max.apply(null, values);
+    var range = Math.max(dataMax - dataMin, 0.5);
+    var min = Math.floor((dataMin - range * 0.2) * 4) / 4;
+    var max = Math.ceil((dataMax + range * 0.2) * 4) / 4;
+    if (max <= min) max = min + 1;
+
+    function y(val) {
+      var frac = (val - min) / (max - min);
+      return H - botPad - frac * (H - topPad - botPad);
+    }
+
+    var step = niceStep(max - min);
+    var ticks = [];
+    for (var t = Math.ceil(min / step) * step; t <= max + 1e-9; t += step) {
+      ticks.push(Math.round(t * 100) / 100);
+    }
+
+    var parts = [];
+
+    // Column background (empty gauge tube)
+    parts.push('<rect x="' + colX + '" y="' + topPad + '" width="' + colW + '" height="' + (H - topPad - botPad) +
+      '" rx="6" fill="#062421" stroke="#2A5850" stroke-width="1.5"/>');
+
+    // Danger zone shading above threshold
+    if (stageThreshold !== null && !isNaN(stageThreshold) && stageThreshold >= min && stageThreshold <= max) {
+      var yThresh = y(stageThreshold);
+      parts.push('<rect x="' + colX + '" y="' + topPad + '" width="' + colW + '" height="' + (yThresh - topPad) +
+        '" fill="var(--danger)" opacity="0.16"/>');
+    }
+
+    // Water fill up to current stage
+    if (currentStage !== null && !isNaN(currentStage)) {
+      var yNow = y(Math.min(Math.max(currentStage, min), max));
+      parts.push('<rect x="' + colX + '" y="' + yNow + '" width="' + colW + '" height="' + (H - botPad - yNow) +
+        '" rx="4" fill="var(--stage)" opacity="0.55"/>');
+    }
+
+    // Tick marks + labels
+    ticks.forEach(function (tv) {
+      var ty = y(tv);
+      parts.push('<line x1="' + (colX - 6) + '" y1="' + ty + '" x2="' + colX + '" y2="' + ty + '" stroke="var(--muted)" stroke-width="1.5"/>');
+      parts.push('<text x="' + (colX - 10) + '" y="' + (ty + 3) + '" font-family="IBM Plex Mono, monospace" font-size="9" fill="var(--muted)" text-anchor="end">' + tv + '</text>');
+    });
+
+    // Threshold marker line
+    if (stageThreshold !== null && !isNaN(stageThreshold) && stageThreshold >= min && stageThreshold <= max) {
+      var yT = y(stageThreshold);
+      parts.push('<line x1="' + colX + '" y1="' + yT + '" x2="' + (colX + colW) + '" y2="' + yT + '" stroke="var(--danger)" stroke-width="2" stroke-dasharray="4 3"/>');
+    }
+
+    // Peak forecast marker
+    if (peakStageRow) {
+      var yP = y(Math.min(Math.max(peakStageRow.predicted_stage_m, min), max));
+      parts.push('<line x1="' + colX + '" y1="' + yP + '" x2="' + (colX + colW) + '" y2="' + yP + '" stroke="var(--discharge)" stroke-width="2" stroke-dasharray="2 3"/>');
+      parts.push('<polygon points="' + (colX + colW + 3) + ',' + yP + ' ' + (colX + colW + 10) + ',' + (yP - 4) + ' ' + (colX + colW + 10) + ',' + (yP + 4) + '" fill="var(--discharge)"/>');
+    }
+
+    // Now marker (triangle pointer on left of column)
+    if (currentStage !== null && !isNaN(currentStage)) {
+      var yN = y(Math.min(Math.max(currentStage, min), max));
+      parts.push('<polygon points="' + (colX - 10) + ',' + yN + ' ' + (colX - 3) + ',' + (yN - 4) + ' ' + (colX - 3) + ',' + (yN + 4) + '" fill="var(--stage)"/>');
+    }
+
+    // Current value readout at top
+    parts.push('<text x="' + (colX + colW / 2) + '" y="16" font-family="Oswald, sans-serif" font-size="13" font-weight="600" fill="var(--paper)" text-anchor="middle">' +
+      (currentStage !== null ? currentStage.toFixed(2) : '—') + ' m</text>');
+
+    svg.innerHTML = parts.join('');
+  }
+
+  function drawChart(data) {
+    var histTimes = data.recent_history.map(function (d) { return d.time; });
+    var histStage = data.recent_history.map(function (d) { return d.stage_m; });
+    var histDischarge = data.recent_history.map(function (d) { return d.discharge_m3s; });
+
+    var fcTimes = data.forecast.map(function (d) { return d.time; });
+    var fcStage = data.forecast.map(function (d) { return d.predicted_stage_m; });
+    var fcStageUpper = data.forecast.map(function (d) { return d.stage_upper_m; });
+    var fcStageLower = data.forecast.map(function (d) { return d.stage_lower_m; });
+    var fcDischarge = data.forecast.map(function (d) { return d.predicted_discharge_m3s; });
+    var fcDischargeUpper = data.forecast.map(function (d) { return d.discharge_upper_m3s; });
+    var fcDischargeLower = data.forecast.map(function (d) { return d.discharge_lower_m3s; });
+    var fcRain = data.forecast.map(function (d) { return d.forecasted_rain_mm_hr; });
+
+    var traces = [
+      { x: histTimes, y: histStage, name: 'Observed Stage', mode: 'lines',
+        line: { color: '#52C7DE', width: 2 }, xaxis: 'x', yaxis: 'y' },
+      { x: fcTimes, y: fcStage, name: 'Stage Forecast', mode: 'lines',
+        line: { color: '#52C7DE', width: 2, dash: 'dash' }, xaxis: 'x', yaxis: 'y' },
+      { x: fcTimes.concat(fcTimes.slice().reverse()),
+        y: fcStageUpper.concat(fcStageLower.slice().reverse()),
+        fill: 'toself', fillcolor: 'rgba(82,199,222,0.15)',
+        line: { color: 'transparent' }, name: 'Stage uncertainty',
+        xaxis: 'x', yaxis: 'y' },
+
+      { x: histTimes, y: histDischarge, name: 'Observed Discharge', mode: 'lines',
+        line: { color: '#EFA857', width: 2 }, xaxis: 'x2', yaxis: 'y2' },
+      { x: fcTimes, y: fcDischarge, name: 'Discharge Forecast', mode: 'lines',
+        line: { color: '#EFA857', width: 2, dash: 'dash' }, xaxis: 'x2', yaxis: 'y2' },
+      { x: fcTimes.concat(fcTimes.slice().reverse()),
+        y: fcDischargeUpper.concat(fcDischargeLower.slice().reverse()),
+        fill: 'toself', fillcolor: 'rgba(239,168,87,0.15)',
+        line: { color: 'transparent' }, name: 'Discharge uncertainty',
+        xaxis: 'x2', yaxis: 'y2' },
+
+      { x: fcTimes, y: fcRain, name: 'Forecasted Rain (mm/hr)', type: 'bar',
+        marker: { color: '#74D6A0' }, xaxis: 'x3', yaxis: 'y3' }
+    ];
+
+    var shapes = [];
+    if (thresholds.stage !== null && !isNaN(thresholds.stage)) {
+      shapes.push({ type: 'line', xref: 'x', yref: 'y', x0: histTimes[0] || fcTimes[0], x1: fcTimes[fcTimes.length - 1],
+        y0: thresholds.stage, y1: thresholds.stage, line: { color: '#E85D50', width: 1.5, dash: 'dot' } });
+    }
+    if (thresholds.discharge !== null && !isNaN(thresholds.discharge)) {
+      shapes.push({ type: 'line', xref: 'x2', yref: 'y2', x0: histTimes[0] || fcTimes[0], x1: fcTimes[fcTimes.length - 1],
+        y0: thresholds.discharge, y1: thresholds.discharge, line: { color: '#E85D50', width: 1.5, dash: 'dot' } });
+    }
+
+    var fontColor = '#ECE7DA';
+    var gridColor = 'rgba(255,255,255,0.08)';
+
+    var layout = {
+      grid: { rows: 3, columns: 1, pattern: 'independent', roworder: 'top to bottom' },
+      margin: { t: 20, r: 20, l: 55, b: 40 },
+      hovermode: 'x unified',
+      showlegend: true,
+      legend: { orientation: 'h', y: -0.08, font: { color: fontColor, family: 'IBM Plex Mono, monospace', size: 11 } },
+      paper_bgcolor: 'transparent',
+      plot_bgcolor: 'transparent',
+      font: { color: fontColor, family: 'IBM Plex Sans, sans-serif' },
+      shapes: shapes,
+      xaxis:  { title: '', matches: 'x3', gridcolor: gridColor, zerolinecolor: gridColor },
+      xaxis2: { title: '', matches: 'x3', gridcolor: gridColor, zerolinecolor: gridColor },
+      xaxis3: { title: 'Time', gridcolor: gridColor, zerolinecolor: gridColor },
+      yaxis:  { title: 'Stage (m)', domain: [0.68, 1], gridcolor: gridColor, zerolinecolor: gridColor },
+      yaxis2: { title: 'Discharge (m³/s)', domain: [0.34, 0.62], gridcolor: gridColor, zerolinecolor: gridColor },
+      yaxis3: { title: 'Rain (mm/hr)', domain: [0, 0.28], gridcolor: gridColor, zerolinecolor: gridColor }
+    };
+
+    Plotly.newPlot('fw-chart', traces, layout, { responsive: true });
+  }
+
+  document.getElementById('fw-submit').addEventListener('click', triggerForecast);
+
+  // Show a default forecast immediately on page load, so visitors see real
+  // data right away instead of a blank chart waiting for a click.
+  triggerForecast();
+})();
+</script>
+
+</body>
+</html>
