@@ -200,7 +200,15 @@
       });
   }
 
+  var forecastInFlight = false;
+
   function triggerForecast() {
+    if (forecastInFlight) return; // a request is already running — ignore this trigger
+    forecastInFlight = true;
+
+    var submitBtn = document.getElementById('fw-submit');
+    submitBtn.disabled = true;
+
     var start = document.getElementById('fw-start').value;
     var horizonValue = document.getElementById('fw-horizon-value').value;
     var horizonUnit = document.getElementById('fw-horizon-unit').value;
@@ -276,6 +284,10 @@
       })
       .catch(function (err) {
         statusEl.textContent = "Error: " + err.message;
+      })
+      .finally(function () {
+        forecastInFlight = false;
+        document.getElementById('fw-submit').disabled = false;
       });
   }
 
